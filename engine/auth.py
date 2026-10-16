@@ -27,15 +27,25 @@ def _read_env_file():
     return env_vars
 
 def _get_auth_config():
-    """Retrieve auth settings from .env file directly."""
+    """Retrieve auth settings from Streamlit secrets, .env file, or environment."""
     file_env = _read_env_file()
-    
-    enabled_str = file_env.get("APP_AUTH_ENABLED") or os.getenv("APP_AUTH_ENABLED", "True")
+
+    def _lookup(k, fallback):
+        # 1. First check Streamlit Cloud Secrets
+        try:
+            if hasattr(st, "secrets") and k in st.secrets:
+                return str(st.secrets[k])
+        except Exception:
+            pass
+        # 2. Then check local .env file or system environment variables
+        return file_env.get(k) or os.getenv(k, fallback)
+
+    enabled_str = _lookup("APP_AUTH_ENABLED", "True")
     enabled = str(enabled_str).strip().lower() in ("true", "1", "yes")
-    
-    admin_user = file_env.get("APP_ADMIN_USER") or os.getenv("APP_ADMIN_USER", "amechi")
-    admin_pass = file_env.get("APP_ADMIN_PASSWORD") or os.getenv("APP_ADMIN_PASSWORD", "kncspro2026")
-    
+
+    admin_user = _lookup("APP_ADMIN_USER", "amechi")
+    admin_pass = _lookup("APP_ADMIN_PASSWORD", "kncspro2026")
+
     return enabled, str(admin_user).strip(), str(admin_pass).strip()
 
 def _verify_credentials(username: str, password: str, admin_user: str, admin_pass: str) -> bool:
@@ -93,7 +103,7 @@ def require_auth() -> bool:
 
         with st.container(border=True):
             st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
-            user_input = st.text_input("Username", placeholder="e.g. name", key="login_username")
+            user_input = st.text_input("Username", placeholder="e.g. amechi", key="login_username")
             pass_input = st.text_input("Password", type="password", placeholder="••••••••••••", key="login_password")
             
             st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
@@ -117,31 +127,32 @@ def require_auth() -> bool:
     return False
 
 def render_logout_widget():
-    """Renders user info and a logout button in the sidebar footer."""
+    """Renders user info and a logout button pinned inside the sidebar."""
     enabled, _, _ = _get_auth_config()
     if not enabled:
         return
         
     user = st.session_state.get("user", "Admin")
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-    st.markdown(f"""
-        <div style="
-            padding: 8px 12px;
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 10px;
-            font-size: 12px;
-            color: #94a3b8;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        ">
-            <span>👤 User: <b style="color: #38bdf8;">{user}</b></span>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    if st.button("Log Out 🚪", key="auth_logout_btn", use_container_width=True):
-        st.session_state["authenticated"] = False
-        st.session_state.pop("user", None)
-        st.rerun()
+    with st.sidebar:
+        st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div style="
+                padding: 8px 12px;
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                font-size: 12px;
+                color: #94a3b8;
+                margin-bottom: 8px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            ">
+                <span>👤 User: <b style="color: #38bdf8;">{user}</b></span>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        if st.button("Log Out 🚪", key="auth_logout_btn", use_container_width=True):
+            st.session_state["authenticated"] = False
+            st.session_state.pop("user", None)
+            st.rerun()
