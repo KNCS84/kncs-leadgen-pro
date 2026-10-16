@@ -1,0 +1,17 @@
+[client]
+showSidebarNavigation = false
+
+[server]
+headless = true
+port = 8501
+runOnSave = false
+
+[runner]
+magicEnabled = false
+
+[theme]
+base = "dark"
+backgroundColor = "#060d19"
+secondaryBackgroundColor = "#0b1628"
+textColor = "#f1f5f9"
+font = "sans serif"

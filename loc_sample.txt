@@ -1,0 +1,9 @@
+TOTAL LOCATIONS: 121704
+
+FIRST 3 RECORDS:
+{'locationId': '1-10000302982', 'locationName': 'Henley House', 'postalCode': 'IP1 6TB'}
+
+{'locationId': '1-10000367985', 'locationName': 'Hertility Health', 'postalCode': 'E11 3RB'}
+
+{'locationId': '1-10000433668', 'locationName': 'Home Visiting Service', 'postalCode': 'NE8 4YL'}
+

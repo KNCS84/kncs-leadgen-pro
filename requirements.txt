@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────
+# KNCS LeadGen Pro — v2.0 (Phase 1 Upgrade)
+# Requirements — verified compatible set
+# Base: v9.7
+# v2.0 changes:
+#   PHASE1-REQ-01: dnspython>=2.4.0 added for MSP cyber
+#                  risk DNS record analysis (SPF, DMARC, DKIM)
+# Last updated: 2025
+# Install: pip install -r requirements.txt
+# After install: playwright install chromium
+# ─────────────────────────────────────────────────────────
+
+# ── Core framework ────────────────────────────────────────
+streamlit==1.32.0
+
+# ── Data / ML ─────────────────────────────────────────────
+pandas==2.2.2
+Pillow==10.3.0
+plotly==5.24.1
+
+# ── Web scraping ──────────────────────────────────────────
+# FIX #3: playwright 1.59.0 does not exist → 1.44.0
+playwright==1.44.0
+beautifulsoup4==4.12.3
+lxml==5.2.2
+requests==2.32.3
+httpx==0.27.2
+# FIX #4: fake-useragent 2.2.0 does not exist → 1.5.1
+fake-useragent==1.5.1
+
+# ── Search / enrichment ───────────────────────────────────
+# FIX #7: required by scorer.py website discovery + social search
+duckduckgo-search>=6.2.0
+
+# ── AI / retry logic ──────────────────────────────────────
+# FIX #8: required by ai_client.py retry decorator
+tenacity>=8.2.3
+
+# ── Async support ─────────────────────────────────────────
+nest_asyncio==1.6.0
+
+# ── Environment ───────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── Streamlit components ──────────────────────────────────
+# FIX #5: 0.3.13 not released → 0.3.12
+streamlit-option-menu==0.3.12
+# FIX #1: streamlit-aggrid 1.0.5 incompatible with streamlit 1.32.0 — REMOVED
+# FIX #2: streamlit-extras conflicts with component versions — REMOVED
+
+# ── Phase 1 Vertical Intelligence ────────────────────────
+# PHASE1-REQ-01: DNS record lookups for MSP cyber risk module
+# Used by: engine/msp/cyber_risk_analyzer.py
+# Checks: SPF, DMARC, DKIM records on prospect domains
+# ssl and socket are Python built-ins — no install needed
+dnspython>=2.4.0

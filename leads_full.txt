@@ -1,0 +1,1837 @@
+1 # pages/leads.py
+2 # KNCS LeadGen Pro — v10.0
+3 # Fixes applied:
+4 #   1. All f-string HTML converted to string concatenation
+5 #   2. CSS block converted to plain string
+6 #   3. Emoji replaced with HTML entity codes in all HTML blocks
+7 #   4. Source icons converted from emoji to safe text labels
+8 #   5. All render functions converted — zero f-string HTML
+9 
+10 from datetime import datetime
+11 import html
+12 import re
+13 import time
+14 from io import StringIO
+15 from typing import Optional, Any
+16 
+17 import pandas as pd
+18 import streamlit as st
+19 
+20 # ─────────────────────────────────────────────────────────
+21 # Safe DB imports
+22 # ─────────────────────────────────────────────────────────
+23 try:
+24     from database import get_all_leads, get_connection
+25     from database_patch import (
+26         update_lead_status,
+27         update_lead_email,
+28         update_lead_enrichment,
+29     )
+30     _DB_AVAILABLE = True
+31 except Exception as _db_err:
+32     import logging as _logging
+33     _logging.getLogger(__name__).error(
+34         "DB import failed: %s", _db_err
+35     )
+36     _DB_AVAILABLE = False
+37     def get_all_leads(limit=5000):       return []
+38     def update_lead_status(*a, **k):     return False
+39     def update_lead_email(*a, **k):      return False
+40     def update_lead_enrichment(*a, **k): return False
+41     get_connection = None
+42 
+43 # ─────────────────────────────────────────────────────────
+44 # Safe scorer imports
+45 # ─────────────────────────────────────────────────────────
+46 try:
+47     from engine.scorer import get_contact_completeness
+48 except Exception:
+49     def get_contact_completeness(lead) -> dict:
+50         fields = {
+51             "Phone":   bool(lead.get("phone")),
+52             "Email":   bool(lead.get("email")),
+53             "Website": bool(lead.get("website")),
+54             "Address": bool(lead.get("address")),
+55         }
+56         filled = sum(1 for v in fields.values() if v)
+57         pct    = filled / len(fields) * 100
+58         return {
+59             "percentage": pct, "score": pct,
+60             "fields": fields, "filled": filled,
+61             "total": len(fields),
+62         }
+63 
+64 # ─────────────────────────────────────────────────────────
+65 # Safe enricher imports
+66 # ─────────────────────────────────────────────────────────
+67 try:
+68     from engine.enricher import find_email_multi_source, enrich_lead
+69     _ENRICHER_AVAILABLE = True
+70 except ImportError:
+71     _ENRICHER_AVAILABLE = False
+72     def find_email_multi_source(*args, **kwargs): return None
+73     def enrich_lead(*args, **kwargs):             pass
+74 
+75 # ─────────────────────────────────────────────────────────
+76 # Safe job manager imports
+77 # ─────────────────────────────────────────────────────────
+78 try:
+79     from engine.job_manager import any_job_running
+80     _JOB_MANAGER_AVAILABLE = True
+81 except ImportError:
+82     _JOB_MANAGER_AVAILABLE = False
+83     def any_job_running(): return False
+84 
+85 # ─────────────────────────────────────────────────────────
+86 # Safe Nigeria imports
+87 # ─────────────────────────────────────────────────────────
+88 try:
+89     from engine.nigeria.google_maps_client import NigeriaGoogleMapsClient
+90     _NG_CLIENT_OK = True
+91 except Exception:
+92     _NG_CLIENT_OK = False
+93 
+94 try:
+95     from engine.nigeria.nigeria_enricher import NigeriaEnricher
+96     _NG_ENRICHER_OK = True
+97 except Exception:
+98     _NG_ENRICHER_OK = False
+99 
+100 try:
+101     from engine.nigeria.decision_maker_finder import DecisionMakerFinder
+102     _NG_DM_OK = True
+103 except Exception:
+104     _NG_DM_OK = False
+105 
+106 # ─────────────────────────────────────────────────────────
+107 # Design tokens
+108 # ─────────────────────────────────────────────────────────
+109 _BG_BASE    = "#060d19"
+110 _BG_SURFACE = "#0b1628"
+111 _BG_RAISED  = "#101f38"
+112 _BG_INPUT   = "#0d1a2e"
+113 _BRAND_BLUE = "#5b8cff"
+114 _BRAND_PUR  = "#7c5cff"
+115 _GREEN      = "#10b981"
+116 _GOLD       = "#f59e0b"
+117 _RED        = "#ef4444"
+118 _TEXT_PRI   = "#f1f5f9"
+119 _TEXT_SEC   = "#94a3b8"
+120 _TEXT_MUT   = "#475569"
+121 _BORDER     = "rgba(255,255,255,0.05)"
+122 _BORDER_MID = "rgba(255,255,255,0.08)"
+123 _BORDER_BRD = "rgba(91,140,255,0.28)"
+124 _GLOW_BLUE  = "rgba(91,140,255,0.18)"
+125 _NG_GREEN   = "#25D366"
+126 
+127 # ─────────────────────────────────────────────────────────
+128 # Nigeria constants — unchanged
+129 # ─────────────────────────────────────────────────────────
+130 _NG_NICHES = {
+131     "Private Schools":             "private_school",
+132     "Private Hospitals & Clinics": "private_hospital",
+133     "Real Estate Companies":       "real_estate",
+134     "Hotels & Guest Houses":       "hotel",
+135     "Manufacturing SMEs":          "manufacturing",
+136     "Construction Companies":      "construction",
+137     "Law Firms":                   "law_firm",
+138 }
+139 
+140 _NG_CITIES = {
+141     "Lagos — Victoria Island": "lagos_vi",
+142     "Lagos — Lekki":           "lagos_lekki",
+143     "Lagos — Ikeja":           "lagos_ikeja",
+144     "Lagos — Surulere":        "lagos_surulere",
+145     "Lagos — Yaba":            "lagos_yaba",
+146     "Abuja — Maitama":         "abuja_maitama",
+147     "Abuja — Wuse 2":          "abuja_wuse",
+148     "Abuja — Garki":           "abuja_garki",
+149     "Port Harcourt — GRA":     "ph_gra",
+150     "Benin City — GRA":        "benin_gra",
+151     "Warri — GRA":             "warri_gra",
+152     "Enugu — GRA":             "enugu_gra",
+153     "Owerri":                  "owerri_central",
+154     "Kano":                    "kano_central",
+155     "Ibadan":                  "ibadan_ring",
+156     "Calabar":                 "calabar_gra",
+157     "Abeokuta":                "abeokuta_central",
+158     "Akure":                   "akure_central",
+159     "Ilorin":                  "ilorin_central",
+160     "Kaduna":                  "kaduna_gra",
+161     "Jos":                     "jos_central",
+162 }
+163 
+164 _NG_CITY_DISPLAY = {
+165     "lagos_vi":          "Victoria Island Lagos",
+166     "lagos_lekki":       "Lekki Lagos",
+167     "lagos_ikeja":       "Ikeja Lagos",
+168     "lagos_surulere":    "Surulere Lagos",
+169     "lagos_yaba":        "Yaba Lagos",
+170     "abuja_maitama":     "Maitama Abuja",
+171     "abuja_wuse":        "Wuse 2 Abuja",
+172     "abuja_garki":       "Garki Abuja",
+173     "ph_gra":            "GRA Port Harcourt",
+174     "benin_gra":         "GRA Benin City",
+175     "warri_gra":         "GRA Warri",
+176     "enugu_gra":         "GRA Enugu",
+177     "owerri_central":    "Owerri",
+178     "kano_central":      "Kano",
+179     "ibadan_ring":       "Ibadan",
+180     "calabar_gra":       "Calabar",
+181     "abeokuta_central":  "Abeokuta",
+182     "akure_central":     "Akure",
+183     "ilorin_central":    "Ilorin",
+184     "kaduna_gra":        "Kaduna",
+185     "jos_central":       "Jos",
+186 }
+187 
+188 _NG_NICHE_DM_TITLES = {
+189     "private_school":   "School Proprietor/Principal",
+190     "private_hospital": "Medical Director",
+191     "real_estate":      "Managing Director",
+192     "hotel":            "General Manager",
+193     "manufacturing":    "Factory Director",
+194     "construction":     "Managing Director",
+195     "law_firm":         "Senior Partner",
+196 }
+197 
+198 # ─────────────────────────────────────────────────────────
+199 # DM source labels
+200 # ─────────────────────────────────────────────────────────
+201 _DM_SOURCE_LABELS = {
+202     "cqc":             "CQC Register",
+203     "companies_house": "Companies House",
+204     "website":         "Website",
+205     "google_maps":     "Google Maps",
+206     "not_found":       "",
+207 }
+208 
+209 # ─────────────────────────────────────────────────────────
+210 # Page CSS — plain string, zero f-string
+211 # ─────────────────────────────────────────────────────────
+212 def _render_page_css() -> None:
+213     css = (
+214         "<style>"
+215 
+216         ".block-container {"
+217         "    padding-top: 1.4rem !important;"
+218         "    padding-bottom: 3rem !important;"
+219         "    max-width: 1400px !important;"
+220         "}"
+221 
+222         # Hero
+223         ".lp-hero {"
+224         "    background: linear-gradient(145deg,"
+225         "        #0b1628 0%, #101f38 50%, #0b1628 100%);"
+226         "    border: 1px solid rgba(255,255,255,0.05);"
+227         "    border-left: 4px solid #5b8cff;"
+228         "    border-radius: 20px; padding: 24px 28px;"
+229         "    margin-bottom: 24px; position: relative; overflow: hidden;"
+230         "}"
+231         ".lp-hero-orb {"
+232         "    position: absolute; top: -80px; right: -80px;"
+233         "    width: 280px; height: 280px; border-radius: 50%;"
+234         "    background: radial-gradient(circle,"
+235         "        rgba(91,140,255,0.12) 0%, transparent 70%);"
+236         "    pointer-events: none;"
+237         "}"
+238         ".lp-hero-eyebrow {"
+239         "    font-size: 10px; font-weight: 700; text-transform: uppercase;"
+240         "    letter-spacing: 2px; color: #5b8cff; margin-bottom: 8px;"
+241         "}"
+242         ".lp-hero-title {"
+243         "    font-size: 30px; font-weight: 900; color: #f1f5f9;"
+244         "    letter-spacing: -1px; line-height: 1.15; margin: 0 0 8px 0;"
+245         "}"
+246         ".lp-hero-sub {"
+247         "    font-size: 13px; color: #475569; font-weight: 500;"
+248         "    line-height: 1.8; max-width: 680px;"
+249         "}"
+250 
+251         # KPI tiles
+252         ".lp-kpi {"
+253         "    background: linear-gradient(145deg, #0b1628 0%, #101f38 100%);"
+254         "    border: 1px solid rgba(255,255,255,0.05); border-radius: 18px;"
+255         "    padding: 18px 18px 14px 18px; position: relative; overflow: hidden;"
+256         "    transition: transform 0.22s ease, border-color 0.25s ease;"
+257         "}"
+258         ".lp-kpi:hover {"
+259         "    transform: translateY(-3px);"
+260         "    border-color: rgba(91,140,255,0.28);"
+261         "    box-shadow: 0 14px 40px rgba(91,140,255,0.14);"
+262         "}"
+263         ".lp-kpi-accent {"
+264         "    position: absolute; top: 0; left: 0; right: 0;"
+265         "    height: 3px; border-radius: 18px 18px 0 0;"
+266         "}"
+267         ".lp-kpi-icon {"
+268         "    font-size: 11px; font-weight: 900; margin-bottom: 10px;"
+269         "    width: 36px; height: 36px; border-radius: 10px;"
+270         "    display: flex; align-items: center; justify-content: center;"
+271         "    background: rgba(255,255,255,0.05);"
+272         "    border: 1px solid rgba(255,255,255,0.08);"
+273         "    letter-spacing: 0.5px;"
+274         "}"
+275         ".lp-kpi-label {"
+276         "    color: #475569; font-size: 9.5px; font-weight: 700;"
+277         "    text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 6px;"
+278         "}"
+279         ".lp-kpi-value {"
+280         "    font-size: 26px; font-weight: 900; color: #f1f5f9;"
+281         "    letter-spacing: -1px; line-height: 1; margin-bottom: 6px;"
+282         "}"
+283         ".lp-kpi-sub { font-size: 11px; font-weight: 600; }"
+284 
+285         # Filters bar
+286         ".lp-filters {"
+287         "    background: linear-gradient(145deg, #0b1628 0%, #101f38 100%);"
+288         "    border: 1px solid rgba(91,140,255,0.14);"
+289         "    border-radius: 16px; padding: 14px 22px 6px 22px;"
+290         "    margin-bottom: 20px;"
+291         "}"
+292         ".lp-filters-label {"
+293         "    font-size: 10px; font-weight: 700; text-transform: uppercase;"
+294         "    letter-spacing: 1.5px; color: #5b8cff; margin-bottom: 12px;"
+295         "}"
+296 
+297         # Section headers
+298         ".lp-sec-head  { margin: 0 0 16px 0; }"
+299         ".lp-sec-title {"
+300         "    font-size: 20px; font-weight: 800; color: #f1f5f9;"
+301         "    letter-spacing: -0.5px; line-height: 1.2; margin: 0 0 4px 0;"
+302         "}"
+303         ".lp-sec-sub {"
+304         "    font-size: 12px; color: #475569; font-weight: 500; margin: 0;"
+305         "}"
+306 
+307         # Segment banner
+308         ".lp-seg-banner {"
+309         "    background: linear-gradient(135deg,"
+310         "        rgba(91,140,255,0.08), rgba(124,92,255,0.04));"
+311         "    border: 1px solid rgba(91,140,255,0.18); border-radius: 14px;"
+312         "    padding: 14px 20px; margin-bottom: 16px;"
+313         "    display: flex; align-items: center; gap: 20px; flex-wrap: wrap;"
+314         "}"
+315         ".lp-seg-stat       { display: flex; align-items: baseline; gap: 6px; }"
+316         ".lp-seg-stat-value { font-size: 22px; font-weight: 900; color: #f1f5f9; }"
+317         ".lp-seg-stat-label { font-size: 12px; color: #475569; font-weight: 500; }"
+318         ".lp-seg-divider    { width: 1px; height: 24px; background: rgba(255,255,255,0.05); }"
+319 
+320         # Lead cards
+321         ".lp-card {"
+322         "    background: linear-gradient(145deg, #0b1628 0%, #101f38 100%);"
+323         "    border: 1px solid rgba(255,255,255,0.05); border-radius: 20px;"
+324         "    padding: 22px; margin-bottom: 16px; position: relative; overflow: hidden;"
+325         "    transition: transform 0.22s ease, border-color 0.25s ease, box-shadow 0.25s ease;"
+326         "}"
+327         ".lp-card:hover {"
+328         "    transform: translateY(-2px);"
+329         "    border-color: rgba(91,140,255,0.22);"
+330         "    box-shadow: 0 12px 36px rgba(91,140,255,0.10);"
+331         "}"
+332         ".lp-card-stripe {"
+333         "    position: absolute; top: 0; left: 0;"
+334         "    width: 4px; height: 100%; border-radius: 20px 0 0 20px;"
+335         "}"
+336         ".lp-card-header {"
+337         "    display: flex; justify-content: space-between;"
+338         "    align-items: flex-start; margin-bottom: 16px; padding-left: 10px;"
+339         "}"
+340         ".lp-card-name {"
+341         "    font-size: 17px; font-weight: 800; color: #f1f5f9;"
+342         "    letter-spacing: -0.3px; margin-bottom: 8px;"
+343         "}"
+344         ".lp-card-badges { display: flex; gap: 6px; flex-wrap: wrap; }"
+345         ".lp-badge {"
+346         "    display: inline-flex; align-items: center; gap: 4px;"
+347         "    padding: 3px 9px; border-radius: 999px; font-size: 10px;"
+348         "    font-weight: 700; text-transform: uppercase;"
+349         "    letter-spacing: 0.5px; white-space: nowrap;"
+350         "}"
+351         ".lp-score-block { text-align: right; flex-shrink: 0; }"
+352         ".lp-score-num {"
+353         "    font-size: 38px; font-weight: 900; line-height: 1; letter-spacing: -2px;"
+354         "}"
+355         ".lp-score-label {"
+356         "    font-size: 9.5px; font-weight: 700; text-transform: uppercase;"
+357         "    letter-spacing: 1.5px; color: #475569; margin-top: 2px;"
+358         "}"
+359         ".lp-contact-grid {"
+360         "    display: grid; grid-template-columns: 1fr 1fr;"
+361         "    gap: 10px; margin-bottom: 14px; padding-left: 10px;"
+362         "}"
+363         ".lp-contact-cell {"
+364         "    background: rgba(255,255,255,0.025);"
+365         "    border: 1px solid rgba(255,255,255,0.05);"
+366         "    border-radius: 12px; padding: 11px 13px;"
+367         "}"
+368         ".lp-contact-cell-label {"
+369         "    color: #475569; font-size: 9.5px; font-weight: 700;"
+370         "    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px;"
+371         "}"
+372         ".lp-contact-cell-value {"
+373         "    color: #f1f5f9; font-size: 13px; font-weight: 600; word-break: break-all;"
+374         "}"
+375         ".lp-social-row {"
+376         "    display: flex; gap: 8px; flex-wrap: wrap;"
+377         "    padding-left: 10px; margin-bottom: 14px;"
+378         "}"
+379         ".lp-social-btn {"
+380         "    display: inline-flex; align-items: center; gap: 6px;"
+381         "    padding: 6px 14px; border-radius: 10px; font-size: 12px;"
+382         "    font-weight: 700; text-decoration: none;"
+383         "}"
+384         ".lp-progress-wrap { padding-left: 10px; }"
+385         ".lp-progress-row {"
+386         "    display: flex; justify-content: space-between;"
+387         "    align-items: center; margin-bottom: 6px;"
+388         "}"
+389         ".lp-progress-label { font-size: 11px; font-weight: 600; color: #94a3b8; }"
+390         ".lp-progress-pct   { font-size: 12px; font-weight: 800; color: #f1f5f9; }"
+391         ".lp-progress-track {"
+392         "    height: 6px; background: rgba(255,255,255,0.05);"
+393         "    border-radius: 999px; overflow: hidden;"
+394         "}"
+395         ".lp-progress-fill {"
+396         "    height: 100%;"
+397         "    background: linear-gradient(90deg, #5b8cff, #7c5cff);"
+398         "    border-radius: 999px;"
+399         "}"
+400 
+401         # Page info
+402         ".lp-page-info   { font-size: 13px; color: #475569; margin-bottom: 18px; }"
+403         ".lp-page-info b { color: #f1f5f9; }"
+404 
+405         # Empty state
+406         ".lp-empty {"
+407         "    text-align: center; padding: 48px 24px;"
+408         "    background: rgba(255,255,255,0.02);"
+409         "    border: 1px dashed rgba(255,255,255,0.08);"
+410         "    border-radius: 18px; margin: 20px 0;"
+411         "}"
+412         ".lp-empty-icon  { font-size: 36px; margin-bottom: 14px; }"
+413         ".lp-empty-title {"
+414         "    font-size: 16px; font-weight: 700; color: #94a3b8; margin-bottom: 6px;"
+415         "}"
+416         ".lp-empty-sub   { font-size: 13px; color: #475569; }"
+417 
+418         # Nigeria cards
+419         ".ng-lead-card {"
+420         "    background: linear-gradient(145deg, #0b1628 0%, #101f38 100%);"
+421         "    border: 1px solid rgba(37,211,102,0.15);"
+422         "    border-radius: 16px; padding: 18px 20px; margin-bottom: 12px;"
+423         "    transition: transform 0.2s ease, border-color 0.25s ease;"
+424         "}"
+425         ".ng-lead-card:hover {"
+426         "    transform: translateY(-2px);"
+427         "    border-color: rgba(37,211,102,0.30);"
+428         "}"
+429         ".ng-lead-name {"
+430         "    font-size: 15px; font-weight: 800; color: #f1f5f9; margin-bottom: 6px;"
+431         "}"
+432         ".ng-lead-dm {"
+433         "    font-size: 12px; color: #25D366; font-weight: 700; margin-bottom: 10px;"
+434         "}"
+435         ".ng-lead-grid {"
+436         "    display: grid; grid-template-columns: 1fr 1fr;"
+437         "    gap: 8px; margin-bottom: 10px;"
+438         "}"
+439         ".ng-lead-field-label {"
+440         "    font-size: 9px; font-weight: 700; text-transform: uppercase;"
+441         "    letter-spacing: 1px; color: #475569; margin-bottom: 3px;"
+442         "}"
+443         ".ng-lead-field-value {"
+444         "    font-size: 12px; color: #f1f5f9; font-weight: 600; word-break: break-all;"
+445         "}"
+446 
+447         # Scrollbar
+448         "::-webkit-scrollbar       { width: 4px; height: 4px; }"
+449         "::-webkit-scrollbar-track { background: transparent; }"
+450         "::-webkit-scrollbar-thumb { background: #101f38; border-radius: 20px; }"
+451         "::-webkit-scrollbar-thumb:hover { background: #5b8cff; }"
+452 
+453         "</style>"
+454     )
+455     st.markdown(css, unsafe_allow_html=True)
+456 
+457 
+458 # ─────────────────────────────────────────────────────────
+459 # Helpers
+460 # ─────────────────────────────────────────────────────────
+461 def _esc(value: Any) -> str:
+462     if value is None:
+463         return ""
+464     return html.escape(str(value))
+465 
+466 
+467 def safe_key(lead_id: Optional[int], suffix: str) -> str:
+468     clean = re.sub(r"[^a-zA-Z0-9]", "_", suffix)[:20]
+469     return "lead_" + str(lead_id or 0) + "_" + clean
+470 
+471 
+472 def _safe_int(value: Any, default: int = 0) -> int:
+473     try:
+474         return int(value) if value is not None else default
+475     except Exception:
+476         return default
+477 
+478 
+479 def _safe_float(value: Any, default: float = 0.0) -> float:
+480     try:
+481         return float(value) if value is not None else default
+482     except Exception:
+483         return default
+484 
+485 
+486 def _is_scraping_active() -> bool:
+487     if not _JOB_MANAGER_AVAILABLE:
+488         return False
+489     try:
+490         return bool(any_job_running())
+491     except Exception:
+492         return False
+493 
+494 
+495 def _score_color(score: int) -> str:
+496     if score >= 70: return _RED
+497     if score >= 50: return _GOLD
+498     return _BRAND_BLUE
+499 
+500 
+501 def _source_color(source: str) -> str:
+502     return {
+503         "google_maps":     _BRAND_BLUE,
+504         "b2bhint":         _BRAND_PUR,
+505         "yelp":            _RED,
+506         "yellowpages":     _GREEN,
+507         "companies_house": "#3b82f6",
+508     }.get(source, _TEXT_MUT)
+509 
+510 
+511 def _source_label(source: str) -> str:
+512     """Safe text label — no emoji — used inside HTML strings."""
+513     return {
+514         "google_maps":     "Maps",
+515         "b2bhint":         "B2B",
+516         "yelp":            "Yelp",
+517         "yellowpages":     "YP",
+518         "companies_house": "GB",
+519     }.get(source, "?")
+520 
+521 
+522 def _section_header(title: str, subtitle: str = "") -> None:
+523     sub_html = (
+524         '<div class="lp-sec-sub">' + _esc(subtitle) + '</div>'
+525         if subtitle else ""
+526     )
+527     st.markdown(
+528         '<div class="lp-sec-head">'
+529         '<div class="lp-sec-title">' + _esc(title) + '</div>'
+530         + sub_html +
+531         '</div>',
+532         unsafe_allow_html=True,
+533     )
+534 
+535 
+536 # ─────────────────────────────────────────────────────────
+537 # Hero — string concatenation
+538 # ─────────────────────────────────────────────────────────
+539 def render_hero() -> None:
+540     now       = datetime.now()
+541     timestamp = _esc(now.strftime("%A, %d %B %Y, %H:%M"))
+542 
+543     st.markdown(
+544         '<div class="lp-hero">'
+545         '<div class="lp-hero-orb"></div>'
+546         '<div class="lp-hero-eyebrow">Lead Intelligence Workspace</div>'
+547         '<div class="lp-hero-title">Your Business Lead Database</div>'
+548         '<div class="lp-hero-sub">'
+549         'UK Care Homes and Nigeria B2B leads &mdash; managed separately'
+550         ' in one place. Select your market below.'
+551         '<br>'
+552         '<span style="color:#94a3b8;">' + timestamp + '</span>'
+553         '</div>'
+554         '</div>',
+555         unsafe_allow_html=True,
+556     )
+557 
+558 
+559 # ─────────────────────────────────────────────────────────
+560 # UK KPIs — string concatenation, entity codes for icons
+561 # ─────────────────────────────────────────────────────────
+562 def render_kpis(leads: list) -> None:
+563     total    = len(leads)
+564     hot      = sum(1 for l in leads if (l.get("opportunity_score") or 0) >= 70)
+565     emails   = sum(1 for l in leads if l.get("email"))
+566     phones   = sum(1 for l in leads if l.get("phone"))
+567     enriched = sum(
+568         1 for l in leads
+569         if str(l.get("enrichment_status", "")).lower()
+570         in ("done", "complete", "completed", "enriched")
+571     )
+572     with_dm = sum(1 for l in leads if l.get("decision_maker_name"))
+573 
+574     # icon, label, value, subtitle, accent
+575     cards = [
+576         ("TL",  "Total Leads", str(f"{total:,}"),    "All leads",             _BRAND_BLUE),
+577         ("HOT", "Hot Leads",   str(f"{hot:,}"),      "High-intent",           _RED),
+578         ("EM",  "Emails",      str(f"{emails:,}"),   "Reachable contacts",    _GREEN),
+579         ("PH",  "Phones",      str(f"{phones:,}"),   "Direct outreach",       "#38bdf8"),
+580         ("DM",  "With DM",     str(f"{with_dm:,}"),  "Named decision makers", _BRAND_PUR),
+581         ("OK",  "Enriched",    str(f"{enriched:,}"), "Processed leads",       _GOLD),
+582     ]
+583 
+584     cols = st.columns(6)
+585     for col, (icon, label, value, sub, accent) in zip(cols, cards):
+586         with col:
+587             st.markdown(
+588                 '<div class="lp-kpi">'
+589                 '<div class="lp-kpi-accent" style="background:' + accent + ';"></div>'
+590                 '<div class="lp-kpi-icon" style="color:' + accent + ';">'
+591                 + icon +
+592                 '</div>'
+593                 '<div class="lp-kpi-label">' + _esc(label) + '</div>'
+594                 '<div class="lp-kpi-value">' + value + '</div>'
+595                 '<div class="lp-kpi-sub" style="color:' + accent + ';">'
+596                 + _esc(sub) +
+597                 '</div>'
+598                 '</div>',
+599                 unsafe_allow_html=True,
+600             )
+601 
+602 
+603 # ─────────────────────────────────────────────────────────
+604 # UK Filters — string concatenation
+605 # ─────────────────────────────────────────────────────────
+606 def render_filters(all_leads: list) -> list:
+607     st.markdown(
+608         '<div class="lp-filters">'
+609         '<div class="lp-filters-label">Lead Filters</div>'
+610         '</div>',
+611         unsafe_allow_html=True,
+612     )
+613 
+614     c1, c2, c3, c4, c5 = st.columns(5)
+615     with c1:
+616         search = st.text_input(
+617             "Search Business",
+618             placeholder="Type name...",
+619             key="leads_search",
+620         )
+621     with c2:
+622         min_score = st.slider(
+623             "Min Score", 0, 100, 0, 5,
+624             key="leads_min_score",
+625         )
+626     with c3:
+627         source = st.selectbox(
+628             "Source",
+629             ["All", "companies_house", "google_maps",
+630              "b2bhint", "yelp", "yellowpages"],
+631             key="leads_source",
+632         )
+633     with c4:
+634         status = st.selectbox(
+635             "Status",
+636             ["All", "new", "called", "interested",
+637              "callback", "deal_closed"],
+638             key="leads_status",
+639         )
+640     with c5:
+641         email_f = st.selectbox(
+642             "Email",
+643             ["All", "Has Email", "Missing Email"],
+644             key="leads_email_filter",
+645         )
+646 
+647     leads = all_leads
+648     if search:
+649         sl    = search.lower()
+650         leads = [l for l in leads if sl in (l.get("business_name", "")).lower()]
+651     if min_score > 0:
+652         leads = [l for l in leads if (l.get("opportunity_score", 0) or 0) >= min_score]
+653     if source != "All":
+654         leads = [l for l in leads if l.get("source") == source]
+655     if status != "All":
+656         leads = [l for l in leads if l.get("contact_status") == status]
+657     if email_f == "Has Email":
+658         leads = [l for l in leads if l.get("email")]
+659     elif email_f == "Missing Email":
+660         leads = [l for l in leads if not l.get("email")]
+661 
+662     return leads
+663 
+664 
+665 # ─────────────────────────────────────────────────────────
+666 # Segment builder — unchanged logic
+667 # ─────────────────────────────────────────────────────────
+668 def build_segments(leads: list) -> dict:
+669     segments: dict = {}
+670     for lead in leads:
+671         industry = (lead.get("industry") or "Unknown").strip()
+672         if industry.lower() in ("", "unknown", "none"):
+673             industry = "Unknown Niche"
+674         city = (
+675             lead.get("city") or lead.get("location", "") or "Unknown Location"
+676         ).strip()
+677         if not city:
+678             city = "Unknown Location"
+679         if "," in city:
+680             city = city.split(",")[0].strip()
+681         key = industry + "||" + city
+682         if key not in segments:
+683             segments[key] = {"industry": industry, "city": city, "leads": []}
+684         segments[key]["leads"].append(lead)
+685 
+686     return dict(
+687         sorted(segments.items(), key=lambda x: len(x[1]["leads"]), reverse=True)
+688     )
+689 
+690 
+691 # ─────────────────────────────────────────────────────────
+692 # Lead card (UK) — full string concatenation
+693 # ─────────────────────────────────────────────────────────
+694 def render_lead_card(lead: dict) -> None:
+695     lead_id = lead.get("id", 0)
+696     score   = _safe_int(lead.get("opportunity_score", 0))
+697     sc_col  = _score_color(score)
+698     src     = lead.get("source") or "unknown"
+699     s_col   = _source_color(src)
+700     s_lbl   = _source_label(src)
+701     name    = lead.get("business_name", "Unknown")
+702 
+703     website_discovered = lead.get("website_discovered", 0)
+704     website_disc_src   = lead.get("website_discovery_source", "")
+705     fb_url  = lead.get("social_facebook_url",  "")
+706     ig_url  = lead.get("social_instagram_url", "")
+707     li_url  = lead.get("social_linkedin_url",  "")
+708     dm      = lead.get("decision_maker_name",  "")
+709     dm_source    = lead.get("dm_source", "")
+710     dm_src_label = _DM_SOURCE_LABELS.get(dm_source, "")
+711     wa_stat      = lead.get("wa_status", "")
+712     cqc_rating   = lead.get("cqc_rating", "")
+713     cqc_url      = lead.get("cqc_url", "")
+714 
+715     completeness = get_contact_completeness(lead)
+716     if isinstance(completeness, dict):
+717         pct = completeness.get("percentage", completeness.get("score", 0))
+718     else:
+719         pct = completeness
+720     pct = max(0.0, min(100.0, _safe_float(pct, 0.0)))
+721 
+722     phone   = _esc(lead.get("phone")   or "Not available")
+723     email   = _esc(lead.get("email")   or "Not available")
+724     website = _esc((lead.get("website") or "Not available")[:42])
+725     city    = _esc(lead.get("city",    ""))
+726     country = _esc(lead.get("country", ""))
+727     ind     = _esc(lead.get("industry", "Unknown"))
+728 
+729     def _badge(bg: str, border: str, text: str, content: str) -> str:
+730         return (
+731             '<span class="lp-badge" style="'
+732             'background:' + bg + '1a;'
+733             'border:1px solid ' + border + '33;'
+734             'color:' + text + ';">'
+735             + content +
+736             '</span>'
+737         )
+738 
+739     # Build badges — all text safe, no emoji in HTML
+740     src_name = src.replace("_", " ").title()
+741     badges = _badge(s_col, s_col, s_col, s_lbl + " " + src_name)
+742     badges += _badge(_TEXT_MUT, _TEXT_MUT, _TEXT_SEC, ind)
+743 
+744     if website_discovered:
+745         badges += _badge(
+746             _GREEN, _GREEN, _GREEN,
+747             "WEB via " + _esc(website_disc_src),
+748         )
+749     if dm:
+750         badges += _badge(_BRAND_PUR, _BRAND_PUR, _BRAND_PUR, "DM: " + _esc(dm))
+751     if cqc_rating:
+752         badges += _badge(_GOLD, _GOLD, _GOLD, "CQC: " + _esc(cqc_rating))
+753     if wa_stat in ("verified", "opted_in", "business_confirmed"):
+754         badges += _badge(
+755             _GREEN, _GREEN, _GREEN,
+756             "WA " + _esc(wa_stat.replace("_", " ").title()),
+757         )
+758 
+759     dm_source_html = ""
+760     if dm and dm_src_label:
+761         dm_source_html = (
+762             '<div style="font-size:10px;color:' + _TEXT_MUT + ';'
+763             'padding-left:2px;margin-top:4px;font-weight:600;">'
+764             'DM Source: ' + _esc(dm_src_label) +
+765             '</div>'
+766         )
+767 
+768     cqc_link_html = ""
+769     if cqc_url:
+770         cqc_link_html = (
+771             '<div style="font-size:10px;padding-left:2px;margin-top:4px;">'
+772             '<a href="' + _esc(cqc_url) + '" target="_blank" '
+773             'style="color:' + _GOLD + ';font-weight:600;text-decoration:none;">'
+774             'View CQC Profile &rarr;</a>'
+775             '</div>'
+776         )
+777 
+778     social_html = ""
+779     if fb_url or ig_url or li_url:
+780         social_html = '<div class="lp-social-row">'
+781         if fb_url:
+782             social_html += (
+783                 '<a href="' + _esc(fb_url) + '" target="_blank"'
+784                 ' class="lp-social-btn"'
+785                 ' style="background:#3b82f61a;'
+786                 'border:1px solid #3b82f633;color:#3b82f6;">'
+787                 'Facebook</a>'
+788             )
+789         if ig_url:
+790             social_html += (
+791                 '<a href="' + _esc(ig_url) + '" target="_blank"'
+792                 ' class="lp-social-btn"'
+793                 ' style="background:#ec48991a;'
+794                 'border:1px solid #ec489933;color:#ec4899;">'
+795                 'Instagram</a>'
+796             )
+797         if li_url:
+798             social_html += (
+799                 '<a href="' + _esc(li_url) + '" target="_blank"'
+800                 ' class="lp-social-btn"'
+801                 ' style="background:#0ea5e91a;'
+802                 'border:1px solid #0ea5e933;color:#0ea5e9;">'
+803                 'LinkedIn</a>'
+804             )
+805         social_html += '</div>'
+806 
+807     pct_str = str(int(pct))
+808 
+809     st.markdown(
+810         '<div class="lp-card">'
+811         '<div class="lp-card-stripe" style="background:' + sc_col + ';"></div>'
+812         '<div class="lp-card-header">'
+813         '<div>'
+814         '<div class="lp-card-name">' + _esc(name) + '</div>'
+815         '<div class="lp-card-badges">' + badges + '</div>'
+816         + dm_source_html
+817         + cqc_link_html +
+818         '</div>'
+819         '<div class="lp-score-block">'
+820         '<div class="lp-score-num" style="color:' + sc_col + ';">' + str(score) + '</div>'
+821         '<div class="lp-score-label">Score</div>'
+822         '</div>'
+823         '</div>'
+824         '<div class="lp-contact-grid">'
+825         '<div class="lp-contact-cell">'
+826         '<div class="lp-contact-cell-label">Phone</div>'
+827         '<div class="lp-contact-cell-value">' + phone + '</div>'
+828         '</div>'
+829         '<div class="lp-contact-cell">'
+830         '<div class="lp-contact-cell-label">Email</div>'
+831         '<div class="lp-contact-cell-value">' + email + '</div>'
+832         '</div>'
+833         '<div class="lp-contact-cell">'
+834         '<div class="lp-contact-cell-label">Website</div>'
+835         '<div class="lp-contact-cell-value">' + website + '</div>'
+836         '</div>'
+837         '<div class="lp-contact-cell">'
+838         '<div class="lp-contact-cell-label">Location</div>'
+839         '<div class="lp-contact-cell-value">' + city + ' ' + country + '</div>'
+840         '</div>'
+841         '</div>'
+842         + social_html +
+843         '<div class="lp-progress-wrap">'
+844         '<div class="lp-progress-row">'
+845         '<span class="lp-progress-label">Contact Completeness</span>'
+846         '<span class="lp-progress-pct">' + pct_str + '%</span>'
+847         '</div>'
+848         '<div class="lp-progress-track">'
+849         '<div class="lp-progress-fill" style="width:' + pct_str + '%;"></div>'
+850         '</div>'
+851         '</div>'
+852         '</div>',
+853         unsafe_allow_html=True,
+854     )
+855 
+856     c1, c2, c3 = st.columns(3)
+857 
+858     with c1:
+859         if not lead.get("email"):
+860             if st.button("Find Email", key=safe_key(lead_id, "find_email")):
+861                 if not _ENRICHER_AVAILABLE:
+862                     st.error("Enricher not available.")
+863                 else:
+864                     with st.spinner("Searching..."):
+865                         try:
+866                             found = find_email_multi_source(
+867                                 business_name=name,
+868                                 website=lead.get("website"),
+869                                 location=lead.get("city", ""),
+870                             )
+871                             if found:
+872                                 update_lead_email(lead_id, found)
+873                                 st.success("Found: " + str(found))
+874                                 st.rerun()
+875                             else:
+876                                 st.warning("No email found.")
+877                         except Exception as e:
+878                             st.error("Failed: " + str(e))
+879 
+880     with c2:
+881         if st.button("Re-Enrich", key=safe_key(lead_id, "re_enrich")):
+882             if not _ENRICHER_AVAILABLE:
+883                 st.error("Enricher not available.")
+884             else:
+885                 with st.spinner("Re-enriching..."):
+886                     try:
+887                         enriched = enrich_lead(
+888                             lead, find_email=True, find_phone=True,
+889                         )
+890                         if _DB_AVAILABLE:
+891                             saved = update_lead_enrichment(lead_id, enriched)
+892                             if saved:
+893                                 _dm_val  = enriched.get("decision_maker_name") or "—"
+894                                 _src_raw = enriched.get("dm_source", "")
+895                                 _src_lbl = _DM_SOURCE_LABELS.get(_src_raw, _src_raw) or "—"
+896                                 st.success(
+897                                     "Re-enriched. DM: "
+898                                     + str(_dm_val)
+899                                     + " (" + str(_src_lbl) + ")"
+900                                 )
+901                             else:
+902                                 st.warning("Enriched but DB save failed.")
+903                         st.rerun()
+904                     except Exception as e:
+905                         st.error("Failed: " + str(e))
+906 
+907     with c3:
+908         if st.button("Mark Called", key=safe_key(lead_id, "mark_called")):
+909             try:
+910                 update_lead_status(lead_id, "called")
+911                 st.success("Updated.")
+912                 st.rerun()
+913             except Exception as e:
+914                 st.error("Failed: " + str(e))
+915 
+916 
+917 # ─────────────────────────────────────────────────────────
+918 # Segment row — unchanged logic, string concat HTML
+919 # ─────────────────────────────────────────────────────────
+920 def render_segment_row(
+921     seg_key: str,
+922     seg_data: dict,
+923     show_cards: bool,
+924     row_idx: int,
+925 ) -> None:
+926     industry = seg_data["industry"]
+927     city     = seg_data["city"]
+928     leads    = seg_data["leads"]
+929     total    = len(leads)
+930     emails   = sum(1 for l in leads if l.get("email"))
+931     phones   = sum(1 for l in leads if l.get("phone"))
+932     hot      = sum(1 for l in leads if (l.get("opportunity_score") or 0) >= 70)
+933     with_dm  = sum(1 for l in leads if l.get("decision_maker_name"))
+934     safe_seg = re.sub(r"[^a-zA-Z0-9]", "_", seg_key)[:30]
+935 
+936     # Expander label — plain Python string, emoji safe here
+937     label = (
+938         industry + "  |  " + city + "  |  "
+939         + str(total) + " leads  |  "
+940         + str(emails) + " emails  |  "
+941         + str(phones) + " phones  |  "
+942         + str(with_dm) + " DM  |  "
+943         + str(hot) + " hot"
+944     )
+945 
+946     with st.expander(label, expanded=False):
+947         seg_df = pd.DataFrame([
+948             {
+949                 "Business":   l.get("business_name"),
+950                 "Phone":      l.get("phone"),
+951                 "Email":      l.get("email"),
+952                 "Website":    l.get("website"),
+953                 "Score":      l.get("opportunity_score"),
+954                 "Status":     l.get("contact_status"),
+955                 "Source":     l.get("source"),
+956                 "City":       l.get("city"),
+957                 "Country":    l.get("country"),
+958                 "DM Name":    l.get("decision_maker_name", ""),
+959                 "DM Source":  _DM_SOURCE_LABELS.get(
+960                     l.get("dm_source", ""), l.get("dm_source", ""),
+961                 ),
+962                 "CQC Rating": l.get("cqc_rating", ""),
+963                 "CQC URL":    l.get("cqc_url", ""),
+964                 "CQC ID":     l.get("cqc_location_id", ""),
+965             }
+966             for l in leads
+967         ])
+968 
+969         _, col_btn = st.columns([3, 1])
+970         with col_btn:
+971             fname = (
+972                 industry + "_" + city + ".csv"
+973             ).replace(" ", "_").replace("/", "_")
+974             st.download_button(
+975                 "Export CSV",
+976                 data=seg_df.to_csv(index=False),
+977                 file_name=fname,
+978                 mime="text/csv",
+979                 key="exp_" + safe_seg + "_" + str(row_idx),
+980             )
+981 
+982         if show_cards:
+983             for idx, lead in enumerate(leads[:10]):
+984                 try:
+985                     render_lead_card(lead)
+986                 except Exception as e:
+987                     st.warning("Card #" + str(idx + 1) + " failed: " + str(e))
+988             if total > 10:
+989                 st.info(
+990                     "Showing first 10 of " + str(total)
+991                     + ". Export CSV to see all."
+992                 )
+993         else:
+994             try:
+995                 st.dataframe(
+996                     seg_df,
+997                     use_container_width=True,
+998                     hide_index=True,
+999                     height=min(400, 40 + len(leads) * 35),
+1000                 )
+1001             except Exception as e:
+1002                 st.warning("Table error: " + str(e))
+1003 
+1004 
+1005 # ─────────────────────────────────────────────────────────
+1006 # Segment view — string concatenation
+1007 # ─────────────────────────────────────────────────────────
+1008 def render_segment_view(leads: list) -> None:
+1009     if not leads:
+1010         st.markdown(
+1011             '<div class="lp-empty">'
+1012             '<div class="lp-empty-icon">&#128229;</div>'
+1013             '<div class="lp-empty-title">No leads match current filters</div>'
+1014             '<div class="lp-empty-sub">Adjust the filters above or run a new search.</div>'
+1015             '</div>',
+1016             unsafe_allow_html=True,
+1017         )
+1018         return
+1019 
+1020     segments   = build_segments(leads)
+1021     seg_count  = len(segments)
+1022     total      = len(leads)
+1023     all_emails = sum(1 for l in leads if l.get("email"))
+1024     all_phones = sum(1 for l in leads if l.get("phone"))
+1025     all_hot    = sum(1 for l in leads if (l.get("opportunity_score") or 0) >= 70)
+1026     all_dm     = sum(1 for l in leads if l.get("decision_maker_name"))
+1027 
+1028     st.markdown(
+1029         '<div class="lp-seg-banner">'
+1030 
+1031         '<div class="lp-seg-stat">'
+1032         '<span class="lp-seg-stat-value">' + str(seg_count) + '</span>'
+1033         '<span class="lp-seg-stat-label">segments</span>'
+1034         '</div>'
+1035 
+1036         '<div class="lp-seg-divider"></div>'
+1037 
+1038         '<div class="lp-seg-stat">'
+1039         '<span class="lp-seg-stat-value">' + str(f"{total:,}") + '</span>'
+1040         '<span class="lp-seg-stat-label">leads</span>'
+1041         '</div>'
+1042 
+1043         '<div class="lp-seg-divider"></div>'
+1044 
+1045         '<div class="lp-seg-stat">'
+1046         '<span class="lp-seg-stat-value" style="color:' + _GREEN + ';">'
+1047         + str(f"{all_emails:,}") +
+1048         '</span>'
+1049         '<span class="lp-seg-stat-label">emails</span>'
+1050         '</div>'
+1051 
+1052         '<div class="lp-seg-divider"></div>'
+1053 
+1054         '<div class="lp-seg-stat">'
+1055         '<span class="lp-seg-stat-value" style="color:' + _BRAND_BLUE + ';">'
+1056         + str(f"{all_phones:,}") +
+1057         '</span>'
+1058         '<span class="lp-seg-stat-label">phones</span>'
+1059         '</div>'
+1060 
+1061         '<div class="lp-seg-divider"></div>'
+1062 
+1063         '<div class="lp-seg-stat">'
+1064         '<span class="lp-seg-stat-value" style="color:' + _BRAND_PUR + ';">'
+1065         + str(f"{all_dm:,}") +
+1066         '</span>'
+1067         '<span class="lp-seg-stat-label">with DM</span>'
+1068         '</div>'
+1069 
+1070         '<div class="lp-seg-divider"></div>'
+1071 
+1072         '<div class="lp-seg-stat">'
+1073         '<span class="lp-seg-stat-value" style="color:' + _RED + ';">'
+1074         + str(f"{all_hot:,}") +
+1075         '</span>'
+1076         '<span class="lp-seg-stat-label">hot</span>'
+1077         '</div>'
+1078 
+1079         '</div>',
+1080         unsafe_allow_html=True,
+1081     )
+1082 
+1083     scraping_active = _is_scraping_active()
+1084     ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
+1085 
+1086     with ctrl1:
+1087         if scraping_active:
+1088             show_cards = True
+1089             st.caption("Card view forced while scraping.")
+1090         else:
+1091             show_cards = st.checkbox(
+1092                 "Show card view inside segments",
+1093                 value=False,
+1094                 key="seg_show_cards",
+1095             )
+1096 
+1097     all_df = pd.DataFrame([
+1098         {
+1099             "Business":   l.get("business_name"),
+1100             "Industry":   l.get("industry"),
+1101             "City":       l.get("city"),
+1102             "Country":    l.get("country"),
+1103             "Phone":      l.get("phone"),
+1104             "Email":      l.get("email"),
+1105             "Website":    l.get("website"),
+1106             "Score":      l.get("opportunity_score"),
+1107             "DM Name":    l.get("decision_maker_name", ""),
+1108             "DM Source":  _DM_SOURCE_LABELS.get(
+1109                 l.get("dm_source", ""), l.get("dm_source", "")
+1110             ),
+1111             "CQC Rating": l.get("cqc_rating", ""),
+1112             "CQC URL":    l.get("cqc_url", ""),
+1113             "CQC ID":     l.get("cqc_location_id", ""),
+1114         }
+1115         for l in leads
+1116     ])
+1117 
+1118     with ctrl2:
+1119         st.download_button(
+1120             "Export All",
+1121             data=all_df.to_csv(index=False),
+1122             file_name="all_leads.csv",
+1123             mime="text/csv",
+1124             key="export_all_seg",
+1125         )
+1126     with ctrl3:
+1127         hot_df = all_df[all_df["Score"].fillna(0) >= 70]
+1128         st.download_button(
+1129             "Export Hot (" + str(len(hot_df)) + ")",
+1130             data=hot_df.to_csv(index=False),
+1131             file_name="hot_leads.csv",
+1132             mime="text/csv",
+1133             key="export_hot_seg",
+1134         )
+1135 
+1136     for row_idx, (seg_key, seg_data) in enumerate(segments.items()):
+1137         render_segment_row(seg_key, seg_data, show_cards, row_idx)
+1138 
+1139 
+1140 # ─────────────────────────────────────────────────────────
+1141 # Table view — string concatenation
+1142 # ─────────────────────────────────────────────────────────
+1143 def render_table_view(leads: list) -> None:
+1144     _section_header("CRM Table View", "Interactive lead management.")
+1145 
+1146     if not leads:
+1147         st.markdown(
+1148             '<div class="lp-empty">'
+1149             '<div class="lp-empty-icon">&#128202;</div>'
+1150             '<div class="lp-empty-title">No leads match current filters</div>'
+1151             '<div class="lp-empty-sub">Adjust the filters above.</div>'
+1152             '</div>',
+1153             unsafe_allow_html=True,
+1154         )
+1155         return
+1156 
+1157     if _is_scraping_active():
+1158         st.info("Table paused during scraping.")
+1159         return
+1160 
+1161     rows = [
+1162         {
+1163             "Business":   l.get("business_name"),
+1164             "Industry":   l.get("industry"),
+1165             "City":       l.get("city"),
+1166             "Country":    l.get("country"),
+1167             "Phone":      l.get("phone"),
+1168             "Email":      l.get("email"),
+1169             "Website":    l.get("website"),
+1170             "Score":      l.get("opportunity_score"),
+1171             "Status":     l.get("contact_status"),
+1172             "Source":     l.get("source"),
+1173             "Enriched":   l.get("enrichment_status"),
+1174             "DM Name":    l.get("decision_maker_name", ""),
+1175             "DM Source":  _DM_SOURCE_LABELS.get(
+1176                 l.get("dm_source", ""), l.get("dm_source", "")
+1177             ),
+1178             "CQC Rating": l.get("cqc_rating", ""),
+1179             "CQC URL":    l.get("cqc_url", ""),
+1180             "CQC ID":     l.get("cqc_location_id", ""),
+1181         }
+1182         for l in leads
+1183     ]
+1184     df = pd.DataFrame(rows)
+1185 
+1186     try:
+1187         st.dataframe(df, use_container_width=True, hide_index=True, height=500)
+1188     except Exception as e:
+1189         st.warning("Table error: " + str(e))
+1190 
+1191     c1, c2 = st.columns(2)
+1192     with c1:
+1193         st.download_button(
+1194             "Export All (CSV)",
+1195             data=df.to_csv(index=False),
+1196             file_name="leads.csv",
+1197             mime="text/csv",
+1198             key="export_all_csv",
+1199         )
+1200     with c2:
+1201         if "Score" in df.columns:
+1202             hot_df = df[df["Score"].fillna(0) >= 70]
+1203             if not hot_df.empty:
+1204                 st.download_button(
+1205                     "Export Hot (" + str(len(hot_df)) + ")",
+1206                     data=hot_df.to_csv(index=False),
+1207                     file_name="hot_leads.csv",
+1208                     mime="text/csv",
+1209                     key="export_hot_csv",
+1210                 )
+1211 
+1212 
+1213 # ─────────────────────────────────────────────────────────
+1214 # Card view — string concatenation
+1215 # ─────────────────────────────────────────────────────────
+1216 def render_card_view(leads: list) -> None:
+1217     _section_header("Lead Cards", "Premium CRM card view.")
+1218 
+1219     if not leads:
+1220         st.markdown(
+1221             '<div class="lp-empty">'
+1222             '<div class="lp-empty-icon">&#127183;</div>'
+1223             '<div class="lp-empty-title">No leads match current filters</div>'
+1224             '<div class="lp-empty-sub">Adjust the filters above.</div>'
+1225             '</div>',
+1226             unsafe_allow_html=True,
+1227         )
+1228         return
+1229 
+1230     per_page    = 8
+1231     total_pages = max(1, (len(leads) + per_page - 1) // per_page)
+1232     page = st.number_input(
+1233         "Page", min_value=1, max_value=total_pages,
+1234         value=1, key="leads_card_page",
+1235     )
+1236     start = (page - 1) * per_page
+1237     end   = start + per_page
+1238 
+1239     st.markdown(
+1240         '<div class="lp-page-info">'
+1241         'Showing <b>' + str(f"{len(leads):,}") + '</b> leads &mdash; '
+1242         'Page <b>' + str(page) + '</b> of <b>' + str(total_pages) + '</b>'
+1243         '</div>',
+1244         unsafe_allow_html=True,
+1245     )
+1246 
+1247     for idx, lead in enumerate(leads[start:end]):
+1248         try:
+1249             render_lead_card(lead)
+1250         except Exception as e:
+1251             st.warning("Card #" + str(start + idx + 1) + " failed: " + str(e))
+1252 
+1253 
+1254 # ─────────────────────────────────────────────────────────
+1255 # Nigeria helpers — unchanged logic
+1256 # ─────────────────────────────────────────────────────────
+1257 def _ng_init_state() -> None:
+1258     defaults = {
+1259         "ng_leads_results":  [],
+1260         "ng_leads_enriched": [],
+1261         "ng_leads_error":    None,
+1262     }
+1263     for k, v in defaults.items():
+1264         if k not in st.session_state:
+1265             st.session_state[k] = v
+1266 
+1267 
+1268 def _ng_build_wa_link(phone: str, message: str) -> str:
+1269     from urllib.parse import quote as _quote
+1270     if not phone:
+1271         return ""
+1272     digits = re.sub(r"[^\d+]", "", phone)
+1273     if digits.startswith("0"):
+1274         digits = "+234" + digits[1:]
+1275     elif digits.startswith("234") and not digits.startswith("+"):
+1276         digits = "+" + digits
+1277     return "https://wa.me/" + digits + "?text=" + _quote(message)
+1278 
+1279 
+1280 def _ng_message(
+1281     dm_name: str, business_name: str, niche: str, city: str,
+1282 ) -> str:
+1283     greeting   = "Hi " + dm_name if dm_name else "Hello"
+1284     city_short = city.split()[0] if city else "Nigeria"
+1285     msgs = {
+1286         "private_school": (
+1287             greeting + ", I came across " + business_name
+1288             + " and was impressed by your work in education in "
+1289             + city_short + ". I'd love to discuss how we can help you"
+1290             " attract more quality students. Do you have 5 minutes this week?"
+1291         ),
+1292         "private_hospital": (
+1293             greeting + ", I noticed " + business_name + " serves "
+1294             + city_short + ". I help clinics grow their patient base"
+1295             " through digital marketing. Could we connect briefly?"
+1296         ),
+1297         "real_estate": (
+1298             greeting + ", I came across " + business_name
+1299             + " and your portfolio caught my attention. I help real"
+1300             " estate companies in " + city_short + " close more deals."
+1301             " Would you be open to a quick call?"
+1302         ),
+1303         "hotel": (
+1304             greeting + ", " + business_name + " looks like a great property."
+1305             " I help hotels in " + city_short + " increase bookings."
+1306             " Can we speak briefly?"
+1307         ),
+1308         "law_firm": (
+1309             greeting + ", I found " + business_name
+1310             + " while researching top law firms in " + city_short
+1311             + ". I help law firms attract high-value clients."
+1312             " Would you be open to a brief chat?"
+1313         ),
+1314     }
+1315     return msgs.get(
+1316         niche,
+1317         greeting + ", I'd love to explore how we can help "
+1318         + business_name + " grow in " + city_short + ". Can we connect?",
+1319     )
+1320 
+1321 
+1322 def _ng_enrich_one(raw: dict, city_display: str) -> dict:
+1323     lead  = dict(raw)
+1324     niche = lead.get("niche", "")
+1325     name  = lead.get("business_name", "")
+1326     if not lead.get("city"):
+1327         lead["city"] = city_display
+1328 
+1329     if _NG_ENRICHER_OK:
+1330         try:
+1331             lead = NigeriaEnricher().enrich_lead(lead)
+1332         except Exception:
+1333             pass
+1334 
+1335     dm_name = dm_title = ""
+1336     if _NG_DM_OK:
+1337         try:
+1338             dm = DecisionMakerFinder().find(
+1339                 business_name=name,
+1340                 website=lead.get("website", ""),
+1341                 city=city_display,
+1342                 niche=niche,
+1343             )
+1344             dm_name  = dm.get("decision_maker_name", "")
+1345             dm_title = dm.get("decision_maker_title", "")
+1346         except Exception:
+1347             pass
+1348 
+1349     if not dm_name:
+1350         dm_name = lead.get("decision_maker", "") or lead.get("dm_name", "")
+1351     if not dm_title:
+1352         dm_title = _NG_NICHE_DM_TITLES.get(niche, "Director")
+1353 
+1354     lead["dm_name"]  = dm_name
+1355     lead["dm_title"] = dm_title
+1356 
+1357     wa = lead.get("whatsapp_number", "") or lead.get("phone", "")
+1358     if wa:
+1359         msg = _ng_message(dm_name, name, niche, city_display)
+1360         lead["outreach_message"] = msg
+1361         lead["wa_outreach_url"]  = _ng_build_wa_link(wa, msg)
+1362         if not lead.get("whatsapp_number"):
+1363             lead["whatsapp_number"] = wa
+1364 
+1365     filled = sum(1 for f in [
+1366         lead.get("business_name"), lead.get("phone"),
+1367         lead.get("whatsapp_number"), lead.get("email"),
+1368         lead.get("dm_name"), lead.get("website"),
+1369         lead.get("address"),
+1370     ] if f and str(f).strip())
+1371     lead["completeness_pct"] = int(filled / 7 * 100)
+1372 
+1373     has_wa = bool(lead.get("whatsapp_number"))
+1374     has_dm = bool(lead.get("dm_name"))
+1375     pct    = lead["completeness_pct"]
+1376     lead["confidence"] = (
+1377         "high"   if has_wa and has_dm and pct >= 60 else
+1378         "medium" if (has_wa or has_dm) and pct >= 35 else
+1379         "low"
+1380     )
+1381     return lead
+1382 
+1383 
+1384 # ─────────────────────────────────────────────────────────
+1385 # Nigeria section UI — string concatenation throughout
+1386 # ─────────────────────────────────────────────────────────
+1387 def render_nigeria_section() -> None:
+1388     _ng_init_state()
+1389 
+1390     # Banner
+1391     st.markdown(
+1392         '<div style="background:linear-gradient(135deg,'
+1393         'rgba(37,211,102,0.06),rgba(37,211,102,0.02));'
+1394         'border:1px solid rgba(37,211,102,0.2);'
+1395         'border-radius:16px;padding:20px 24px;margin-bottom:20px;">'
+1396         '<div style="font-size:11px;font-weight:700;'
+1397         'text-transform:uppercase;letter-spacing:2px;'
+1398         'color:#25D366;margin-bottom:6px;">'
+1399         'Nigeria B2B Lead Engine'
+1400         '</div>'
+1401         '<div style="font-size:18px;font-weight:900;'
+1402         'color:#f1f5f9;margin-bottom:6px;">'
+1403         'Nigerian Business Discovery'
+1404         '</div>'
+1405         '<div style="font-size:12px;color:#475569;">'
+1406         'Find decision makers across 7 niches and 21 cities. '
+1407         'Data is fully separate from UK leads.'
+1408         '</div>'
+1409         '</div>',
+1410         unsafe_allow_html=True,
+1411     )
+1412 
+1413     # Status indicators
+1414     cs1, cs2, cs3 = st.columns(3)
+1415     with cs1:
+1416         if _NG_CLIENT_OK:
+1417             st.success("Search Engine Ready")
+1418         else:
+1419             st.error("Search Engine Not Loaded")
+1420     with cs2:
+1421         if _NG_ENRICHER_OK:
+1422             st.success("Enricher Ready")
+1423         else:
+1424             st.warning("Enricher Not Available")
+1425     with cs3:
+1426         if _NG_DM_OK:
+1427             st.success("DM Finder Ready")
+1428         else:
+1429             st.warning("DM Finder Not Available")
+1430 
+1431     st.markdown("---")
+1432 
+1433     # Search controls
+1434     col_a, col_b, col_c, col_d = st.columns([2, 2, 1, 1])
+1435     with col_a:
+1436         niche_label = st.selectbox(
+1437             "Niche",
+1438             options=list(_NG_NICHES.keys()),
+1439             key="ng_leads_niche_sel",
+1440         )
+1441     with col_b:
+1442         city_label = st.selectbox(
+1443             "City",
+1444             options=list(_NG_CITIES.keys()),
+1445             key="ng_leads_city_sel",
+1446         )
+1447     with col_c:
+1448         max_results = st.number_input(
+1449             "Max", min_value=5, max_value=60, value=10, key="ng_leads_max",
+1450         )
+1451     with col_d:
+1452         gmaps_key = st.text_input(
+1453             "API Key", placeholder="Optional", type="password", key="ng_leads_api",
+1454         )
+1455 
+1456     btn1, btn2, btn3 = st.columns(3)
+1457     with btn1:
+1458         search_btn = st.button(
+1459             "Find Businesses", type="primary",
+1460             use_container_width=True, key="ng_leads_search_btn",
+1461             disabled=not _NG_CLIENT_OK,
+1462         )
+1463     with btn2:
+1464         enrich_btn = st.button(
+1465             "Enrich + Decision Makers",
+1466             use_container_width=True, key="ng_leads_enrich_btn",
+1467             disabled=len(st.session_state.get("ng_leads_results", [])) == 0,
+1468         )
+1469     with btn3:
+1470         clear_btn = st.button(
+1471             "Clear", use_container_width=True, key="ng_leads_clear_btn",
+1472         )
+1473 
+1474     if clear_btn:
+1475         st.session_state["ng_leads_results"]  = []
+1476         st.session_state["ng_leads_enriched"] = []
+1477         st.session_state["ng_leads_error"]    = None
+1478         st.rerun()
+1479 
+1480     niche_key = _NG_NICHES[niche_label]
+1481     city_key  = _NG_CITIES[city_label]
+1482     city_disp = _NG_CITY_DISPLAY.get(city_key, city_label)
+1483 
+1484     if search_btn and _NG_CLIENT_OK:
+1485         with st.spinner("Searching " + niche_label + " in " + city_label + "..."):
+1486             try:
+1487                 client  = NigeriaGoogleMapsClient(
+1488                     api_key=gmaps_key.strip() if gmaps_key else ""
+1489                 )
+1490                 results = client.search_businesses(
+1491                     niche=niche_key, city_key=city_key,
+1492                     max_results=int(max_results),
+1493                 )
+1494                 if results:
+1495                     for r in results:
+1496                         r["search_label_niche"] = niche_label
+1497                         r["search_label_city"]  = city_label
+1498 
+1499                     existing = st.session_state.get("ng_leads_results", [])
+1500                     existing_names = {
+1501                         l.get("business_name", "").lower() for l in existing
+1502                     }
+1503                     new = [
+1504                         r for r in results
+1505                         if r.get("business_name", "").lower() not in existing_names
+1506                     ]
+1507                     st.session_state["ng_leads_results"] = existing + new
+1508                     st.session_state["ng_leads_error"] = None
+1509                     st.success(
+1510                         "Found " + str(len(results))
+1511                         + " businesses (" + str(len(new)) + " new). "
+1512                         "Click Enrich next."
+1513                     )
+1514                 else:
+1515                     st.warning("No businesses found. Try different settings.")
+1516             except Exception as exc:
+1517                 st.session_state["ng_leads_error"] = str(exc)
+1518                 st.error("Search error: " + str(exc))
+1519 
+1520     if enrich_btn:
+1521         raw = st.session_state.get("ng_leads_results", [])
+1522         if raw:
+1523             enriched_list = []
+1524             prog   = st.progress(0)
+1525             status = st.empty()
+1526             total  = len(raw)
+1527 
+1528             for i, lead in enumerate(raw):
+1529                 bname = lead.get("business_name", "Lead " + str(i + 1))
+1530                 status.markdown("Enriching **" + str(i + 1) + "/" + str(total) + ":** " + bname + "...")
+1531                 prog.progress((i + 1) / total)
+1532                 try:
+1533                     enriched_list.append(_ng_enrich_one(lead, city_disp))
+1534                 except Exception:
+1535                     lead_copy = dict(lead)
+1536                     lead_copy.update({
+1537                         "dm_name": "", "dm_title": "",
+1538                         "confidence": "low", "completeness_pct": 0,
+1539                     })
+1540                     enriched_list.append(lead_copy)
+1541                 time.sleep(0.05)
+1542 
+1543             st.session_state["ng_leads_enriched"] = enriched_list
+1544             prog.empty()
+1545             status.empty()
+1546 
+1547             with_wa = sum(1 for l in enriched_list if l.get("whatsapp_number"))
+1548             with_dm = sum(1 for l in enriched_list if l.get("dm_name"))
+1549             st.success(
+1550                 str(len(enriched_list)) + " enriched | "
+1551                 + str(with_dm) + " DMs | "
+1552                 + str(with_wa) + " WhatsApp"
+1553             )
+1554 
+1555     if st.session_state.get("ng_leads_error"):
+1556         st.error(str(st.session_state["ng_leads_error"]))
+1557 
+1558     raw      = st.session_state.get("ng_leads_results",  [])
+1559     enriched = st.session_state.get("ng_leads_enriched", [])
+1560     display  = enriched if enriched else raw
+1561 
+1562     if not display:
+1563         st.markdown(
+1564             '<div class="lp-empty">'
+1565             '<div class="lp-empty-icon">&#127475;&#127468;</div>'
+1566             '<div class="lp-empty-title">No Nigeria leads yet</div>'
+1567             '<div class="lp-empty-sub">'
+1568             'Select a niche and city above, then click Find Businesses.'
+1569             '</div>'
+1570             '</div>',
+1571             unsafe_allow_html=True,
+1572         )
+1573         return
+1574 
+1575     # KPIs
+1576     ng_m1, ng_m2, ng_m3, ng_m4, ng_m5 = st.columns(5)
+1577     ng_m1.metric("Total", len(display))
+1578     ng_m2.metric(
+1579         "Decision Makers",
+1580         sum(1 for l in display if l.get("dm_name") or l.get("decision_maker")),
+1581     )
+1582     ng_m3.metric("WhatsApp", sum(1 for l in display if l.get("whatsapp_number")))
+1583     ng_m4.metric("Email",    sum(1 for l in display if l.get("email")))
+1584     ng_m5.metric(
+1585         "High Confidence",
+1586         sum(1 for l in display if l.get("confidence") == "high"),
+1587     )
+1588 
+1589     st.markdown("---")
+1590 
+1591     ng_t1, ng_t2, ng_t3 = st.tabs([
+1592         "All " + str(len(display)) + " Leads",
+1593         "Lead Cards",
+1594         "WhatsApp Ready",
+1595     ])
+1596 
+1597     with ng_t1:
+1598         rows = [{
+1599             "Business Name":  l.get("business_name", ""),
+1600             "Decision Maker": l.get("dm_name", "") or l.get("decision_maker", ""),
+1601             "DM Title":       l.get("dm_title", ""),
+1602             "Phone":          l.get("phone", ""),
+1603             "WhatsApp":       l.get("whatsapp_number", ""),
+1604             "Email":          l.get("email", ""),
+1605             "Website":        l.get("website", ""),
+1606             "Address":        l.get("address", ""),
+1607             "City":           l.get("city", ""),
+1608             "Niche":          l.get("niche", ""),
+1609             "Rating":         l.get("rating", ""),
+1610             "Confidence":     l.get("confidence", ""),
+1611             "Complete %":     l.get("completeness_pct", ""),
+1612             "Source":         l.get("source", ""),
+1613         } for l in display]
+1614 
+1615         if rows:
+1616             df_ng = pd.DataFrame(rows)
+1617             st.dataframe(df_ng, use_container_width=True, hide_index=True, height=400)
+1618             ts  = datetime.now().strftime("%Y%m%d_%H%M")
+1619             ex1, ex2 = st.columns(2)
+1620             with ex1:
+1621                 buf = StringIO()
+1622                 df_ng.to_csv(buf, index=False)
+1623                 st.download_button(
+1624                     "Download All CSV",
+1625                     data=buf.getvalue(),
+1626                     file_name="nigeria_leads_" + ts + ".csv",
+1627                     mime="text/csv",
+1628                     key="ng_dl_all",
+1629                 )
+1630             with ex2:
+1631                 wa_rows = [r for r in rows if r.get("WhatsApp")]
+1632                 if wa_rows:
+1633                     wa_buf = StringIO()
+1634                     pd.DataFrame(wa_rows).to_csv(wa_buf, index=False)
+1635                     st.download_button(
+1636                         "WhatsApp List (" + str(len(wa_rows)) + ")",
+1637                         data=wa_buf.getvalue(),
+1638                         file_name="nigeria_wa_" + ts + ".csv",
+1639                         mime="text/csv",
+1640                         key="ng_dl_wa",
+1641                     )
+1642 
+1643     with ng_t2:
+1644         conf_order = {"high": 0, "medium": 1, "low": 2}
+1645         conf_dots  = {"high": "&#128994;", "medium": "&#128993;", "low": "&#128308;"}
+1646 
+1647         for lead in sorted(
+1648             display,
+1649             key=lambda l: conf_order.get(l.get("confidence", "low"), 2),
+1650         ):
+1651             conf     = lead.get("confidence", "low")
+1652             dot      = conf_dots.get(conf, "&#128308;")
+1653             bname    = lead.get("business_name", "Unknown")
+1654             dm       = lead.get("dm_name", "") or lead.get("decision_maker", "")
+1655             dm_title = lead.get("dm_title", "")
+1656             wa       = lead.get("whatsapp_number", "")
+1657             phone    = lead.get("phone", "")
+1658             email    = lead.get("email", "")
+1659             website  = lead.get("website", "")
+1660             address  = lead.get("address", "")
+1661             pct      = lead.get("completeness_pct", 0)
+1662             wa_url   = lead.get("wa_outreach_url", "")
+1663             message  = lead.get("outreach_message", "")
+1664 
+1665             dm_line = ""
+1666             if dm:
+1667                 t = " &mdash; " + _esc(dm_title) if dm_title else ""
+1668                 dm_line = (
+1669                     '<div class="ng-lead-dm">'
+1670                     + _esc(dm) + t +
+1671                     '</div>'
+1672                 )
+1673 
+1674             wa_btn = ""
+1675             if wa_url:
+1676                 wa_btn = (
+1677                     '<a href="' + _esc(wa_url) + '" target="_blank"'
+1678                     ' style="display:inline-flex;align-items:center;gap:6px;'
+1679                     'padding:7px 16px;border-radius:10px;'
+1680                     'background:rgba(37,211,102,0.15);'
+1681                     'border:1px solid rgba(37,211,102,0.3);'
+1682                     'color:#25D366;font-size:12px;font-weight:700;'
+1683                     'text-decoration:none;margin-top:10px;">'
+1684                     'Open WhatsApp Chat'
+1685                     '</a>'
+1686                 )
+1687 
+1688             st.markdown(
+1689                 '<div class="ng-lead-card">'
+1690                 '<div style="display:flex;justify-content:space-between;'
+1691                 'align-items:flex-start;">'
+1692                 '<div style="flex:1;">'
+1693                 '<div class="ng-lead-name">'
+1694                 + dot + ' ' + _esc(bname) +
+1695                 '</div>'
+1696                 + dm_line +
+1697                 '</div>'
+1698                 '<div style="text-align:right;flex-shrink:0;">'
+1699                 '<div style="font-size:11px;color:' + _TEXT_MUT + ';font-weight:700;">'
+1700                 + str(pct) + '% complete'
+1701                 '</div>'
+1702                 '<div style="font-size:10px;color:' + _TEXT_MUT + ';">'
+1703                 + conf.upper() +
+1704                 '</div>'
+1705                 '</div>'
+1706                 '</div>'
+1707                 '<div class="ng-lead-grid">'
+1708                 '<div>'
+1709                 '<div class="ng-lead-field-label">Phone</div>'
+1710                 '<div class="ng-lead-field-value">' + _esc(phone or "—") + '</div>'
+1711                 '</div>'
+1712                 '<div>'
+1713                 '<div class="ng-lead-field-label">WhatsApp</div>'
+1714                 '<div class="ng-lead-field-value">' + _esc(wa or "—") + '</div>'
+1715                 '</div>'
+1716                 '<div>'
+1717                 '<div class="ng-lead-field-label">Email</div>'
+1718                 '<div class="ng-lead-field-value">' + _esc(email or "—") + '</div>'
+1719                 '</div>'
+1720                 '<div>'
+1721                 '<div class="ng-lead-field-label">Website</div>'
+1722                 '<div class="ng-lead-field-value">'
+1723                 + _esc((website or "—")[:35]) +
+1724                 '</div>'
+1725                 '</div>'
+1726                 '</div>'
+1727                 '<div style="font-size:11px;color:' + _TEXT_MUT + ';margin-bottom:6px;">'
+1728                 + _esc(address or lead.get("city", "")) +
+1729                 '</div>'
+1730                 + wa_btn +
+1731                 '</div>',
+1732                 unsafe_allow_html=True,
+1733             )
+1734 
+1735             if message:
+1736                 with st.expander("Outreach message"):
+1737                     st.write(message)
+1738 
+1739     with ng_t3:
+1740         wa_leads = [l for l in display if l.get("whatsapp_number")]
+1741         if wa_leads:
+1742             st.markdown("### " + str(len(wa_leads)) + " Leads with WhatsApp")
+1743             conf_dots = {"high": "&#128994;", "medium": "&#128993;", "low": "&#128308;"}
+1744             for lead in wa_leads:
+1745                 conf   = lead.get("confidence", "low")
+1746                 dot    = conf_dots.get(conf, "&#128308;")
+1747                 bname  = lead.get("business_name", "Unknown")
+1748                 dm     = lead.get("dm_name", "") or lead.get("decision_maker", "")
+1749                 wa     = lead.get("whatsapp_number", "")
+1750                 wa_url = lead.get("wa_outreach_url", "")
+1751                 msg    = lead.get("outreach_message", "")
+1752 
+1753                 c1, c2, c3 = st.columns([3, 2, 2])
+1754                 with c1:
+1755                     st.markdown(dot + " **" + bname + "**")
+1756                     if dm:
+1757                         st.caption(dm)
+1758                 with c2:
+1759                     st.code(wa, language=None)
+1760                 with c3:
+1761                     if wa_url:
+1762                         st.markdown("[Send Message](" + wa_url + ")")
+1763                 if msg:
+1764                     with st.expander("Message"):
+1765                         st.write(msg)
+1766                 st.divider()
+1767         else:
+1768             st.info("No WhatsApp numbers found. Run Enrich first.")
+1769 
+1770 
+1771 # ─────────────────────────────────────────────────────────
+1772 # MAIN ENTRY POINT
+1773 # ─────────────────────────────────────────────────────────
+1774 def render_leads_page() -> None:
+1775     _render_page_css()
+1776     render_hero()
+1777 
+1778     st.markdown(
+1779         '<div style="font-size:11px;font-weight:700;'
+1780         'text-transform:uppercase;letter-spacing:1.5px;'
+1781         'color:' + _TEXT_MUT + ';margin-bottom:8px;">'
+1782         'Select Market'
+1783         '</div>',
+1784         unsafe_allow_html=True,
+1785     )
+1786     market = st.radio(
+1787         "market_radio",
+1788         options=["UK Businesses", "Nigeria B2B"],
+1789         horizontal=True,
+1790         label_visibility="collapsed",
+1791         key="leads_market_radio",
+1792     )
+1793     st.divider()
+1794 
+1795     if "UK" in market:
+1796         if not _DB_AVAILABLE:
+1797             st.error("Database module not available.")
+1798             return
+1799 
+1800         try:
+1801             all_leads = get_all_leads(limit=5000)
+1802         except Exception as e:
+1803             st.error("Cannot load leads: " + str(e))
+1804             return
+1805 
+1806         if not all_leads:
+1807             st.markdown(
+1808                 '<div class="lp-empty">'
+1809                 '<div class="lp-empty-icon">&#128229;</div>'
+1810                 '<div class="lp-empty-title">No UK leads yet</div>'
+1811                 '<div class="lp-empty-sub">'
+1812                 'Run a search from Lead Search to populate your database.'
+1813                 '</div>'
+1814                 '</div>',
+1815                 unsafe_allow_html=True,
+1816             )
+1817             return
+1818 
+1819         render_kpis(all_leads)
+1820         st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
+1821         filtered = render_filters(all_leads)
+1822         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+1823 
+1824         tabs = st.tabs(["Lead Segments", "CRM Table", "Lead Cards"])
+1825         with tabs[0]:
+1826             render_segment_view(filtered)
+1827         with tabs[1]:
+1828             render_table_view(filtered)
+1829         with tabs[2]:
+1830             render_card_view(filtered)
+1831 
+1832     else:
+1833         render_nigeria_section()
+1834 
+1835 
+1836 def render() -> None:
+1837     render_leads_page()

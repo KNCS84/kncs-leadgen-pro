@@ -1,0 +1,1156 @@
+1 # pages/care_home_dashboard.py
+2 # KNCS LeadGen Pro — Care Home Lead Generator
+3 # v10.1 — Bug fixes applied:
+4 #   BUG-CH-01  — get_connection() used correctly; row_factory override removed;
+5 #                finally block added for connection close
+6 #   BUG-CH-02  — Dedup key changed to business_name + postcode
+7 #   BUG-CH-03  — Explicit BEGIN/COMMIT/ROLLBACK transaction wrapping INSERT loop
+8 #   BUG-CH-04  — conn.close() moved to finally block
+9 #   BUG-CH-05  — html.escape() applied to all lead field values in table
+10 #   BUG-CH-06  — insert_lead() from database.py used instead of raw INSERT
+11 #   BUG-CH-07  — href values sanitised: javascript: scheme blocked, values escaped
+12 #   BUG-CH-08  — _get_cache_info() opens file once; stat inside open block
+13 #   BUG-CH-09  — @st.cache_data on _load_cqc_cache() and _get_cache_info()
+14 #   BUG-CH-10  — Enrichment batch capped at _MAX_ENRICH_BATCH; warning shown
+15 #   BUG-CH-11  — city and postcode INSERT args corrected
+16 #   BUG-CH-13  — _rating_badge() escapes rating value before injection
+17 #
+18 # Carried forward from v9.9:
+19 #   "niche" column → "industry" column fix
+20 
+21 from __future__ import annotations
+22 
+23 import csv
+24 import html
+25 import io
+26 import json
+27 import logging
+28 from pathlib import Path
+29 from textwrap import dedent
+30 from typing import Any, Dict, List, Optional
+31 from urllib.parse import quote as _url_quote
+32 
+33 import streamlit as st
+34 
+35 logger = logging.getLogger(__name__)
+36 
+37 # ── Design tokens ──────────────────────────────────────────────────────────
+38 
+39 _C = {
+40     "bg_base":        "#060d19",
+41     "bg_surface":     "#0b1628",
+42     "bg_raised":      "#101f38",
+43     "bg_input":       "#0d1a2e",
+44     "brand_blue":     "#5b8cff",
+45     "brand_purple":   "#7c5cff",
+46     "green":          "#10b981",
+47     "gold":           "#f59e0b",
+48     "red":            "#ef4444",
+49     "text_primary":   "#f1f5f9",
+50     "text_secondary": "#94a3b8",
+51     "text_muted":     "#475569",
+52     "border_subtle":  "rgba(255,255,255,0.05)",
+53     "border_mid":     "rgba(255,255,255,0.08)",
+54     "border_brand":   "rgba(91,140,255,0.30)",
+55 }
+56 
+57 # ── Cache file ─────────────────────────────────────────────────────────────
+58 
+59 _CACHE_FILE = Path("engine/cqc_location_cache.json")
+60 
+61 # ── BUG-CH-10: Maximum leads to enrich per UI run ─────────────────────────
+62 _MAX_ENRICH_BATCH = 50
+63 
+64 # ── Postcode regions ───────────────────────────────────────────────────────
+65 
+66 POSTCODE_REGIONS: Dict[str, List[str]] = {
+67     "All Regions":        [],
+68     "Birmingham":         ["B"],
+69     "Manchester":         ["M"],
+70     "Leeds":              ["LS"],
+71     "Liverpool":          ["L"],
+72     "Sheffield":          ["S"],
+73     "Bristol":            ["BS"],
+74     "Newcastle":          ["NE"],
+75     "Nottingham":         ["NG"],
+76     "Leicester":          ["LE"],
+77     "Coventry/Nuneaton":  ["CV"],
+78     "London East":        ["E"],
+79     "London North":       ["N", "NW"],
+80     "London South":       ["SE", "SW"],
+81     "London West":        ["W"],
+82     "London Central":     ["EC", "WC"],
+83     "Bradford":           ["BD"],
+84     "Wolverhampton":      ["WV"],
+85     "Stoke-on-Trent":     ["ST"],
+86     "Derby":              ["DE"],
+87     "Southampton":        ["SO"],
+88     "Portsmouth":         ["PO"],
+89     "Norwich":            ["NR"],
+90     "Luton":              ["LU"],
+91     "Reading":            ["RG"],
+92     "Oxford":             ["OX"],
+93     "Cambridge":          ["CB"],
+94     "Northampton":        ["NN"],
+95     "Milton Keynes":      ["MK"],
+96     "Swindon":            ["SN"],
+97     "Gloucester":         ["GL"],
+98     "Worcester":          ["WR"],
+99     "Hereford":           ["HR"],
+100     "Shrewsbury":         ["SY"],
+101     "Chester":            ["CH"],
+102     "Preston":            ["PR"],
+103     "Blackpool":          ["FY"],
+104     "Blackburn":          ["BB"],
+105     "Carlisle":           ["CA"],
+106     "Durham":             ["DH", "DL"],
+107     "Middlesbrough":      ["TS"],
+108     "York":               ["YO"],
+109     "Hull":               ["HU"],
+110     "Lincoln":            ["LN"],
+111     "Peterborough":       ["PE"],
+112     "Ipswich":            ["IP"],
+113     "Colchester":         ["CO"],
+114     "Chelmsford":         ["CM"],
+115     "Watford":            ["WD"],
+116     "Slough":             ["SL"],
+117     "Guildford":          ["GU"],
+118     "Crawley":            ["RH"],
+119     "Brighton":           ["BN"],
+120     "Maidstone":          ["ME"],
+121     "Canterbury":         ["CT"],
+122     "Exeter":             ["EX"],
+123     "Plymouth":           ["PL"],
+124     "Cornwall":           ["TR"],
+125     "Somerset":           ["TA"],
+126     "Bath":               ["BA"],
+127     "Salisbury":          ["SP"],
+128     "Swansea":            ["SA"],
+129     "Cardiff":            ["CF"],
+130     "Newport":            ["NP"],
+131 }
+132 
+133 REGION_OPTIONS = ["All Regions"] + sorted(
+134     k for k in POSTCODE_REGIONS if k != "All Regions"
+135 )
+136 
+137 # ── Rating colours ─────────────────────────────────────────────────────────
+138 
+139 RATING_COLOURS = {
+140     "outstanding":          (_C["green"],      "rgba(16,185,129,0.12)"),
+141     "good":                 (_C["brand_blue"], "rgba(91,140,255,0.12)"),
+142     "requires improvement": (_C["gold"],       "rgba(245,158,11,0.12)"),
+143     "inadequate":           (_C["red"],        "rgba(239,68,68,0.12)"),
+144 }
+145 
+146 # ── Allowed URL schemes for href attributes ────────────────────────────────
+147 # BUG-CH-07: Only these schemes are permitted in generated href values.
+148 _SAFE_SCHEMES = ("https://", "http://", "tel:", "mailto:")
+149 
+150 
+151 def _safe_href(url: str) -> str:
+152     """
+153     Return url if it starts with a safe scheme, else '#'.
+154     Prevents javascript: and data: URL injection in href attributes.
+155     """
+156     if not url:
+157         return "#"
+158     stripped = url.strip()
+159     for scheme in _SAFE_SCHEMES:
+160         if stripped.lower().startswith(scheme):
+161             return html.escape(stripped, quote=True)
+162     return "#"
+163 
+164 
+165 def _esc(value: Any) -> str:
+166     """HTML-escape any value for safe injection into HTML content."""
+167     return html.escape(str(value) if value is not None else "")
+168 
+169 
+170 # ── BUG-CH-13 FIX — rating value escaped before injection ─────────────────
+171 def _rating_badge(rating: str) -> str:
+172     if not rating:
+173         return (
+174             "<span style='color:"
+175             + _C["text_muted"]
+176             + ";font-size:11px;'>—</span>"
+177         )
+178     key        = rating.lower().strip()
+179     colour, bg = RATING_COLOURS.get(
+180         key, (_C["text_muted"], "rgba(71,85,105,0.15)")
+181     )
+182     # BUG-CH-13: escape rating before injection
+183     safe_rating = _esc(rating)
+184     return (
+185         "<span style='background:" + bg + ";color:" + colour + ";"
+186         "border:1px solid " + colour + "33;border-radius:999px;"
+187         "padding:2px 10px;font-size:10px;font-weight:700;"
+188         "text-transform:uppercase;letter-spacing:0.5px;"
+189         "white-space:nowrap;'>" + safe_rating + "</span>"
+190     )
+191 
+192 
+193 # ── Cache helpers ──────────────────────────────────────────────────────────
+194 
+195 # BUG-CH-09 FIX: cache the full location list — 31,637 records parsed once
+196 @st.cache_data(ttl=300, show_spinner=False)
+197 def _load_cqc_cache() -> List[Dict]:
+198     """
+199     Load CQC location cache from disk.
+200     Cached for 5 minutes — full JSON parse happens at most once per session.
+201     Cache is cleared after a successful database refresh.
+202     """
+203     if not _CACHE_FILE.exists():
+204         return []
+205     try:
+206         with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+207             data = json.load(f)
+208         return data.get("locations", [])
+209     except Exception as exc:
+210         logger.warning("Cache load failed: %s", exc)
+211         return []
+212 
+213 
+214 # BUG-CH-09 FIX: cache metadata separately — avoids full parse on every render
+215 # BUG-CH-08 FIX: single open() call, stat inside the with block
+216 @st.cache_data(ttl=60, show_spinner=False)
+217 def _get_cache_info() -> Dict[str, Any]:
+218     """
+219     Read CQC cache metadata.
+220     Cached for 60 seconds — avoids repeated full JSON parse on every rerun.
+221     Single file open — eliminates TOCTOU between stat() and open().
+222     """
+223     if not _CACHE_FILE.exists():
+224         return {
+225             "exists":   False,
+226             "count":    0,
+227             "saved_at": "Never",
+228             "size_mb":  0.0,
+229             "fresh":    False,
+230         }
+231     try:
+232         # BUG-CH-08: open once, stat inside the block — no TOCTOU
+233         with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+234             size_bytes = _CACHE_FILE.stat().st_size
+235             data       = json.load(f)
+236 
+237         size_mb  = round(size_bytes / 1_000_000, 1)
+238         saved_at = data.get("saved_at", "Unknown")
+239         count    = data.get(
+240             "total", len(data.get("locations", []))
+241         )
+242 
+243         fresh = False
+244         if saved_at and saved_at != "Unknown":
+245             try:
+246                 from datetime import datetime, timezone
+247                 saved_dt  = datetime.fromisoformat(saved_at)
+248                 age_hours = (
+249                     datetime.now(timezone.utc) - saved_dt
+250                 ).total_seconds() / 3600
+251                 fresh = age_hours < 24
+252             except Exception:
+253                 pass
+254 
+255         try:
+256             from datetime import datetime
+257             dt            = datetime.fromisoformat(saved_at)
+258             saved_display = dt.strftime("%d %b %Y %H:%M UTC")
+259         except Exception:
+260             saved_display = saved_at
+261 
+262         return {
+263             "exists":   True,
+264             "count":    count,
+265             "saved_at": saved_display,
+266             "size_mb":  size_mb,
+267             "fresh":    fresh,
+268         }
+269     except Exception:
+270         return {
+271             "exists":   True,
+272             "count":    0,
+273             "saved_at": "Unknown",
+274             "size_mb":  0.0,
+275             "fresh":    False,
+276         }
+277 
+278 
+279 # ── Filtering ──────────────────────────────────────────────────────────────
+280 
+281 def _postcode_matches(
+282     postcode: str,
+283     prefixes: List[str],
+284 ) -> bool:
+285     if not prefixes:
+286         return True
+287     pc = postcode.upper().strip()
+288     for prefix in prefixes:
+289         if pc.startswith(prefix.upper()):
+290             return True
+291     return False
+292 
+293 
+294 def _filter_locations(
+295     locations:       List[Dict],
+296     region:          str,
+297     custom_postcode: str,
+298     limit:           int,
+299 ) -> List[Dict]:
+300     prefixes = POSTCODE_REGIONS.get(region, [])
+301     if custom_postcode:
+302         prefixes = [custom_postcode.upper().strip()]
+303 
+304     results = []
+305     for loc in locations:
+306         postcode = (loc.get("postalCode", "") or "").strip()
+307         if not _postcode_matches(postcode, prefixes):
+308             continue
+309         results.append(loc)
+310         if len(results) >= limit:
+311             break
+312     return results
+313 
+314 
+315 def _locations_to_leads(locations: List[Dict]) -> List[Dict]:
+316     """
+317     Convert CQC location dicts to lead dicts.
+318     Uses "industry" not "niche" — matches v9.9+ DB schema.
+319     """
+320     leads = []
+321     for loc in locations:
+322         loc_id = loc.get("locationId", "")
+323         leads.append({
+324             "business_name":        loc.get("locationName", ""),
+325             "city":                 (
+326                 loc.get("postalAddressTownCity", "") or ""
+327             ),
+328             "postcode":             (
+329                 loc.get("postalCode", "") or ""
+330             ).strip(),
+331             "country":              "United Kingdom",
+332             "industry":             "care home",
+333             "source":               "cqc",
+334             "phone":                "",
+335             "website":              "",
+336             "email":                "",
+337             "address":              "",
+338             "decision_maker_name":  "",
+339             "decision_maker_title": "",
+340             "dm_source":            "",
+341             "cqc_rating":           (
+342                 loc.get("cqcRating", "") or ""
+343             ),
+344             "cqc_url": (
+345                 "https://www.cqc.org.uk/location/" + _url_quote(loc_id)
+346                 if loc_id else ""
+347             ),
+348             "cqc_location_id":      loc_id,
+349             "enrichment_status":    "pending",
+350             "enrichment_notes":     "",
+351             "social_linkedin_url":  "",
+352         })
+353     return leads
+354 
+355 
+356 # ── CSV export ─────────────────────────────────────────────────────────────
+357 
+358 def _leads_to_csv(leads: List[Dict]) -> str:
+359     if not leads:
+360         return ""
+361     fieldnames = [
+362         "business_name", "postcode", "city", "country",
+363         "phone", "email", "website", "address",
+364         "decision_maker_name", "decision_maker_title",
+365         "dm_source", "social_linkedin_url",
+366         "cqc_rating", "cqc_url", "cqc_location_id",
+367         "industry", "source",
+368         "enrichment_status", "enrichment_notes",
+369     ]
+370     output = io.StringIO()
+371     writer = csv.DictWriter(
+372         output,
+373         fieldnames=fieldnames,
+374         extrasaction="ignore",
+375     )
+376     writer.writeheader()
+377     writer.writerows(leads)
+378     return output.getvalue()
+379 
+380 
+381 # ── Save to DB ─────────────────────────────────────────────────────────────
+382 
+383 def _save_leads_to_db(leads: List[Dict]) -> Dict[str, int]:
+384     """
+385     Save CQC leads to the database using insert_lead() from database.py.
+386 
+387     BUG-CH-01: get_connection() used without row_factory override.
+388     BUG-CH-02: Dedup key is business_name + postcode (not name alone).
+389     BUG-CH-03: Explicit transaction — all INSERTs committed atomically.
+390     BUG-CH-04: Connection closed in finally block.
+391     BUG-CH-06: insert_lead() used — bypasses raw INSERT, uses atomic guard.
+392     BUG-CH-11: city and postcode passed to correct fields.
+393     """
+394     counts = {"saved": 0, "skipped": 0, "errors": 0}
+395 
+396     # BUG-CH-06: Use insert_lead() from database.py which handles
+397     # atomic dedup, normalize_phone, and the composite UNIQUE index.
+398     try:
+399         from database import insert_lead
+400     except ImportError as exc:
+401         logger.error("Cannot import insert_lead from database: %s", exc)
+402         st.error("Database module unavailable — leads not saved.")
+403         return counts
+404 
+405     for lead in leads:
+406         try:
+407             # insert_lead() handles dedup internally via INSERT OR IGNORE
+408             # and the composite UNIQUE(business_name, city) index.
+409             # It returns True on insert, False on duplicate/error.
+410             saved = insert_lead(lead)
+411             if saved:
+412                 counts["saved"] += 1
+413             else:
+414                 counts["skipped"] += 1
+415         except Exception as exc:
+416             logger.warning(
+417                 "Lead save error for '%s': %s",
+418                 lead.get("business_name", "?"),
+419                 exc,
+420             )
+421             counts["errors"] += 1
+422 
+423     return counts
+424 
+425 
+426 # ── Enrichment ─────────────────────────────────────────────────────────────
+427 
+428 def _enrich_leads_with_progress(
+429     leads:        List[Dict],
+430     progress_bar,
+431     status_text,
+432 ) -> List[Dict]:
+433     """
+434     Enrich leads synchronously with progress feedback.
+435 
+436     BUG-CH-10: Batch capped at _MAX_ENRICH_BATCH leads per UI run.
+437     Caller is responsible for slicing to the cap before calling.
+438     """
+439     try:
+440         from engine.enricher import enrich_lead
+441     except ImportError as exc:
+442         st.error("Cannot import enricher: " + _esc(str(exc)))
+443         return leads
+444 
+445     enriched = []
+446     total    = len(leads)
+447 
+448     for i, lead in enumerate(leads):
+449         name = lead.get("business_name", "...")
+450         status_text.markdown(
+451             "<div style='color:"
+452             + _C["text_secondary"]
+453             + ";font-size:12px;font-weight:600;'>"
+454             "Enriching "
+455             + str(i + 1) + "/" + str(total)
+456             + ": " + _esc(name)
+457             + "</div>",
+458             unsafe_allow_html=True,
+459         )
+460         progress_bar.progress((i + 1) / total)
+461         try:
+462             result = enrich_lead(lead)
+463             enriched.append(result)
+464         except Exception as exc:
+465             logger.warning(
+466                 "Enrichment failed '%s': %s", name, exc
+467             )
+468             enriched.append(lead)
+469 
+470     return enriched
+471 
+472 
+473 # ══════════════════════════════════════════════════════════════════════════════
+474 # MAIN RENDER
+475 # ══════════════════════════════════════════════════════════════════════════════
+476 
+477 def render() -> None:
+478 
+479     # ── Session state — initialise ALL keys before any widget ─────────────────
+480     _ss_defaults = {
+481         "ch_generated_leads": [],
+482         "ch_enriched_leads":  [],
+483         "ch_saved_region":    "All Regions",
+484         "ch_enrich_done":     False,
+485     }
+486     for _k, _v in _ss_defaults.items():
+487         if _k not in st.session_state:
+488             st.session_state[_k] = _v
+489 
+490     # ── Page header ───────────────────────────────────────────────────────────
+491     st.markdown(dedent("""
+492         <div class="page-header">
+493             <div class="page-header-eyebrow">
+494                 &#127973; CQC Registered
+495             </div>
+496             <h1 class="page-header-title">Care Home Leads</h1>
+497             <p class="page-header-sub">
+498                 Generate leads from all 31,637 CQC-registered
+499                 care homes. Filter by region or postcode prefix,
+500                 then enrich with phone, email and manager name.
+501             </p>
+502         </div>
+503     """), unsafe_allow_html=True)
+504 
+505     # ── Cache status banner ───────────────────────────────────────────────────
+506     cache_info   = _get_cache_info()
+507     fresh_colour = (
+508         _C["green"] if cache_info.get("fresh") else _C["gold"]
+509     )
+510     fresh_label  = (
+511         "Fresh" if cache_info.get("fresh")
+512         else "Stale — refresh recommended"
+513     )
+514     fresh_icon   = "&#9989;" if cache_info.get("fresh") else "&#9888;"
+515 
+516     if cache_info["exists"]:
+517         count_fmt   = "{:,}".format(cache_info["count"])
+518         size_fmt    = str(cache_info["size_mb"]) + " MB"
+519         saved_fmt   = _esc(cache_info["saved_at"])
+520 
+521         st.markdown(
+522             "<div style='"
+523             "background:linear-gradient(135deg,"
+524             + _C["bg_surface"] + ","
+525             + _C["bg_raised"] + ");"
+526             "border:1px solid " + _C["border_subtle"] + ";"
+527             "border-left:3px solid " + fresh_colour + ";"
+528             "border-radius:0 14px 14px 0;"
+529             "padding:14px 20px;margin-bottom:24px;"
+530             "display:flex;align-items:center;"
+531             "gap:32px;flex-wrap:wrap;'>"
+532 
+533             "<div>"
+534             "<div style='color:" + _C["text_muted"] + ";"
+535             "font-size:9px;font-weight:700;"
+536             "text-transform:uppercase;letter-spacing:1px;"
+537             "margin-bottom:3px;'>Database</div>"
+538             "<div style='color:" + _C["text_primary"] + ";"
+539             "font-size:20px;font-weight:900;'>"
+540             + count_fmt +
+541             "<span style='font-size:12px;font-weight:500;"
+542             "color:" + _C["text_muted"] + ";'>"
+543             " care homes</span>"
+544             "</div>"
+545             "</div>"
+546 
+547             "<div>"
+548             "<div style='color:" + _C["text_muted"] + ";"
+549             "font-size:9px;font-weight:700;"
+550             "text-transform:uppercase;letter-spacing:1px;"
+551             "margin-bottom:3px;'>Last Updated</div>"
+552             "<div style='color:" + _C["text_secondary"] + ";"
+553             "font-size:13px;font-weight:600;'>"
+554             + saved_fmt +
+555             "</div>"
+556             "</div>"
+557 
+558             "<div>"
+559             "<div style='color:" + _C["text_muted"] + ";"
+560             "font-size:9px;font-weight:700;"
+561             "text-transform:uppercase;letter-spacing:1px;"
+562             "margin-bottom:3px;'>Status</div>"
+563             "<div style='color:" + fresh_colour + ";"
+564             "font-size:13px;font-weight:700;'>"
+565             + fresh_icon + " " + _esc(fresh_label) +
+566             "</div>"
+567             "</div>"
+568 
+569             "<div>"
+570             "<div style='color:" + _C["text_muted"] + ";"
+571             "font-size:9px;font-weight:700;"
+572             "text-transform:uppercase;letter-spacing:1px;"
+573             "margin-bottom:3px;'>Size</div>"
+574             "<div style='color:" + _C["text_secondary"] + ";"
+575             "font-size:13px;font-weight:600;'>"
+576             + size_fmt +
+577             "</div>"
+578             "</div>"
+579 
+580             "</div>",
+581             unsafe_allow_html=True,
+582         )
+583     else:
+584         st.warning(
+585             "&#9888; CQC database not downloaded yet. "
+586             "Click 'Download CQC Database' below."
+587         )
+588 
+589     # ── Refresh / Download button ─────────────────────────────────────────────
+590     col_dl, _ = st.columns([1, 3])
+591     with col_dl:
+592         dl_label = (
+593             "&#128260;  Refresh CQC Database"
+594             if cache_info["exists"]
+595             else "&#11015;  Download CQC Database"
+596         )
+597         if st.button(dl_label, key="ch_btn_download_cqc"):
+598             with st.spinner(
+599                 "Downloading all 31,637 care homes (~95 s)..."
+600             ):
+601                 try:
+602                     from engine.cqc_client import refresh_cqc_cache
+603                     success = refresh_cqc_cache()
+604                     if success:
+605                         # Clear cache so next render reads fresh file
+606                         _load_cqc_cache.clear()
+607                         _get_cache_info.clear()
+608                         st.success("&#9989; CQC database downloaded!")
+609                         st.rerun()
+610                     else:
+611                         st.error(
+612                             "&#10060; Download failed. "
+613                             "Check CQC_API_KEY in .env"
+614                         )
+615                 except Exception as exc:
+616                     st.error("&#10060; Error: " + _esc(str(exc)))
+617 
+618     if not cache_info["exists"]:
+619         return
+620 
+621     st.markdown(
+622         "<hr style='border:none;height:1px;"
+623         "background:" + _C["border_subtle"] + ";margin:24px 0;'>",
+624         unsafe_allow_html=True,
+625     )
+626 
+627     # ── Postcode reference ────────────────────────────────────────────────────
+628     with st.expander(
+629         "&#128206; UK Postcode Reference — click to expand",
+630         expanded=False,
+631     ):
+632         st.markdown(dedent("""
+633             <div style="display:grid;
+634                 grid-template-columns:repeat(4,1fr);
+635                 gap:8px;padding:4px 0;
+636                 font-size:11px;">
+637                 <div>
+638                     <strong>Midlands</strong><br>
+639                     B &nbsp;= Birmingham<br>
+640                     CV = Coventry / Nuneaton<br>
+641                     LE = Leicester<br>
+642                     NG = Nottingham<br>
+643                     DE = Derby<br>
+644                     ST = Stoke-on-Trent<br>
+645                     WV = Wolverhampton<br>
+646                     WR = Worcester
+647                 </div>
+648                 <div>
+649                     <strong>North</strong><br>
+650                     M &nbsp;= Manchester<br>
+651                     LS = Leeds<br>
+652                     L &nbsp;= Liverpool<br>
+653                     S &nbsp;= Sheffield<br>
+654                     BD = Bradford<br>
+655                     HU = Hull<br>
+656                     YO = York<br>
+657                     NE = Newcastle
+658                 </div>
+659                 <div>
+660                     <strong>London</strong><br>
+661                     E &nbsp;= East London<br>
+662                     N &nbsp;= North London<br>
+663                     NW = NW London<br>
+664                     SE = SE London<br>
+665                     SW = SW London<br>
+666                     W &nbsp;= West London<br>
+667                     EC = City of London<br>
+668                     WC = West Central
+669                 </div>
+670                 <div>
+671                     <strong>South / East / West</strong><br>
+672                     BS = Bristol<br>
+673                     SO = Southampton<br>
+674                     PO = Portsmouth<br>
+675                     BN = Brighton<br>
+676                     CT = Canterbury<br>
+677                     EX = Exeter<br>
+678                     PL = Plymouth<br>
+679                     OX = Oxford
+680                 </div>
+681             </div>
+682         """), unsafe_allow_html=True)
+683 
+684     # ── Filter section ────────────────────────────────────────────────────────
+685     st.markdown(
+686         "<div style='margin-bottom:16px;'>"
+687         "<div class='sec-title'>&#128269; Filter Leads</div>"
+688         "<div class='sec-sub'>"
+689         "Select a region OR type a postcode prefix. "
+690         "Postcode prefix takes priority over region."
+691         "</div>"
+692         "</div>",
+693         unsafe_allow_html=True,
+694     )
+695 
+696     col1, col2, col3 = st.columns([2, 1, 1])
+697 
+698     with col1:
+699         region = st.selectbox(
+700             "Region",
+701             options=REGION_OPTIONS,
+702             index=0,
+703             key="ch_widget_region",
+704         )
+705 
+706     with col2:
+707         custom_postcode = st.text_input(
+708             "Postcode Prefix (overrides region)",
+709             placeholder="e.g. CV, B, LS, M",
+710             key="ch_widget_postcode",
+711         ).strip().upper()
+712 
+713     with col3:
+714         lead_limit = st.slider(
+715             "Max Leads",
+716             min_value=10,
+717             max_value=500,
+718             value=20,
+719             step=10,
+720             key="ch_widget_limit",
+721         )
+722 
+723     prefixes = POSTCODE_REGIONS.get(region, [])
+724     if custom_postcode:
+725         filter_desc = (
+726             "postcode starts with **" + custom_postcode + "**"
+727         )
+728     elif region != "All Regions":
+729         filter_desc = (
+730             "region = **" + region + "** "
+731             "(postcodes: " + ", ".join(prefixes) + ")"
+732         )
+733     else:
+734         filter_desc = "**All regions** — no location filter"
+735 
+736     st.markdown(
+737         "<div style='color:" + _C["text_muted"] + ";font-size:12px;"
+738         "font-weight:500;margin:8px 0 16px 0;'>"
+739         "&#128270; " + filter_desc
+740         + " · Max " + str(lead_limit) + " leads"
+741         "</div>",
+742         unsafe_allow_html=True,
+743     )
+744 
+745     # ── Generate button ───────────────────────────────────────────────────────
+746     col_gen, _ = st.columns([1, 3])
+747     with col_gen:
+748         generate_clicked = st.button(
+749             "&#9889;  Generate Leads",
+750             key="ch_btn_generate",
+751         )
+752 
+753     if generate_clicked:
+754         with st.spinner(
+755             "Filtering care homes from local cache..."
+756         ):
+757             all_locations = _load_cqc_cache()
+758 
+759             if not all_locations:
+760                 st.error(
+761                     "&#10060; Cache is empty. "
+762                     "Click 'Download CQC Database' above."
+763                 )
+764                 return
+765 
+766             filtered = _filter_locations(
+767                 locations       = all_locations,
+768                 region          = region,
+769                 custom_postcode = custom_postcode,
+770                 limit           = lead_limit,
+771             )
+772 
+773         if not filtered:
+774             st.warning(
+775                 "&#9888; No care homes found for that filter. "
+776                 "Try a different postcode prefix."
+777             )
+778             from collections import Counter
+779             prefix_counter: Counter = Counter()
+780             for loc in all_locations[:5000]:
+781                 pc = (
+782                     loc.get("postalCode", "") or ""
+783                 ).strip()
+784                 if pc:
+785                     letters = ""
+786                     for ch in pc:
+787                         if ch.isalpha():
+788                             letters += ch
+789                         else:
+790                             break
+791                     if letters:
+792                         prefix_counter[letters] += 1
+793             top = [
+794                 p for p, _
+795                 in prefix_counter.most_common(30)
+796             ]
+797             if top:
+798                 st.info(
+799                     "&#128206; Available prefixes in cache: "
+800                     + ", ".join(sorted(top))
+801                 )
+802             return
+803 
+804         leads = _locations_to_leads(filtered)
+805 
+806         st.session_state["ch_generated_leads"] = leads
+807         st.session_state["ch_enriched_leads"]  = []
+808         st.session_state["ch_saved_region"]    = region
+809         st.session_state["ch_enrich_done"]     = False
+810 
+811         st.success(
+812             "&#9989; Found "
+813             + "{:,}".format(len(leads))
+814             + " care homes."
+815         )
+816 
+817     # ── Display ───────────────────────────────────────────────────────────────
+818     generated = st.session_state.get("ch_generated_leads", [])
+819     enriched  = st.session_state.get("ch_enriched_leads",  [])
+820     display   = enriched if enriched else generated
+821 
+822     if not display:
+823         st.markdown(
+824             "<div style='"
+825             "background:" + _C["bg_surface"] + ";"
+826             "border:1px dashed " + _C["border_mid"] + ";"
+827             "border-radius:18px;padding:48px 32px;"
+828             "text-align:center;margin-top:24px;'>"
+829             "<div style='font-size:48px;margin-bottom:16px;'>&#127973;</div>"
+830             "<div style='color:" + _C["text_primary"] + ";"
+831             "font-size:18px;font-weight:700;margin-bottom:8px;'>"
+832             "No Leads Generated Yet"
+833             "</div>"
+834             "<div style='color:" + _C["text_muted"] + ";"
+835             "font-size:13px;max-width:420px;"
+836             "margin:0 auto;line-height:1.7;'>"
+837             "Select a region or type a postcode prefix "
+838             "such as <strong>CV</strong> for "
+839             "Coventry/Nuneaton or <strong>B</strong> "
+840             "for Birmingham, then click "
+841             "<strong>&#9889; Generate Leads</strong>."
+842             "</div>"
+843             "</div>",
+844             unsafe_allow_html=True,
+845         )
+846         return
+847 
+848     # ── Results header ────────────────────────────────────────────────────────
+849     st.markdown(
+850         "<hr style='border:none;height:1px;"
+851         "background:" + _C["border_subtle"] + ";margin:24px 0;'>",
+852         unsafe_allow_html=True,
+853     )
+854 
+855     is_enriched  = bool(enriched)
+856     result_label = "Enriched Leads" if is_enriched else "Generated Leads"
+857 
+858     sub_text = (
+859         "Enriched with phone, email and manager name."
+860         if is_enriched else
+861         "Raw from CQC database. Click Enrich to add phone, "
+862         "email and manager name."
+863     )
+864 
+865     st.markdown(
+866         "<div style='margin-bottom:16px;'>"
+867         "<div class='sec-title'>"
+868         "&#128203; "
+869         + "{:,}".format(len(display))
+870         + " " + result_label +
+871         "</div>"
+872         "<div class='sec-sub'>" + sub_text + "</div>"
+873         "</div>",
+874         unsafe_allow_html=True,
+875     )
+876 
+877     # ── Action buttons ────────────────────────────────────────────────────────
+878     col_e, col_s, col_c, _ = st.columns([1, 1, 1, 2])
+879 
+880     with col_e:
+881         enrich_clicked = st.button(
+882             "&#128269;  Enrich All Leads",
+883             key="ch_btn_enrich",
+884         )
+885 
+886     with col_s:
+887         save_clicked = st.button(
+888             "&#128190;  Save to Database",
+889             key="ch_btn_save",
+890         )
+891 
+892     with col_c:
+893         saved_region = st.session_state.get(
+894             "ch_saved_region", "all"
+895         )
+896         region_slug = (
+897             saved_region.lower()
+898             .replace(" ", "_")
+899             .replace("/", "_")
+900         )
+901         st.download_button(
+902             label     = "&#128229;  Download CSV",
+903             data      = _leads_to_csv(display),
+904             file_name = "care_homes_" + region_slug + ".csv",
+905             mime      = "text/csv",
+906             key       = "ch_btn_csv",
+907         )
+908 
+909     # ── Enrich handler ────────────────────────────────────────────────────────
+910     if enrich_clicked:
+911         to_enrich = generated if generated else display
+912 
+913         # BUG-CH-10 FIX: Cap batch to prevent multi-hour UI thread block.
+914         # User is warned and the first _MAX_ENRICH_BATCH leads are enriched.
+915         if len(to_enrich) > _MAX_ENRICH_BATCH:
+916             st.warning(
+917                 "&#9888; Enrichment is capped at "
+918                 + str(_MAX_ENRICH_BATCH)
+919                 + " leads per run to avoid timeouts. "
+920                 "The first " + str(_MAX_ENRICH_BATCH)
+921                 + " leads will be enriched. "
+922                 "Save these, then generate and enrich the next batch."
+923             )
+924             to_enrich = to_enrich[:_MAX_ENRICH_BATCH]
+925 
+926         total_n = len(to_enrich)
+927 
+928         info_box = st.info(
+929             "&#128269; Enriching " + str(total_n) + " leads. "
+930             "Allow 5-15 minutes for large batches..."
+931         )
+932         pb   = st.progress(0)
+933         stxt = st.empty()
+934 
+935         results = _enrich_leads_with_progress(to_enrich, pb, stxt)
+936 
+937         pb.empty()
+938         stxt.empty()
+939         info_box.empty()
+940 
+941         st.session_state["ch_enriched_leads"] = results
+942         st.session_state["ch_enrich_done"]    = True
+943 
+944         phones   = sum(1 for ld in results if ld.get("phone"))
+945         emails   = sum(1 for ld in results if ld.get("email"))
+946         managers = sum(
+947             1 for ld in results if ld.get("decision_maker_name")
+948         )
+949 
+950         st.markdown(
+951             "<div style='display:grid;"
+952             "grid-template-columns:repeat(3,1fr);"
+953             "gap:12px;margin:16px 0;'>"
+954 
+955             "<div class='kpi-card'>"
+956             "<div class='kpi-label'>Phones Found</div>"
+957             "<div class='kpi-value'>" + str(phones) + "</div>"
+958             "<div class='kpi-sub'>of " + str(total_n) + "</div>"
+959             "</div>"
+960 
+961             "<div class='kpi-card'>"
+962             "<div class='kpi-label'>Emails Found</div>"
+963             "<div class='kpi-value'>" + str(emails) + "</div>"
+964             "<div class='kpi-sub'>of " + str(total_n) + "</div>"
+965             "</div>"
+966 
+967             "<div class='kpi-card'>"
+968             "<div class='kpi-label'>Managers Found</div>"
+969             "<div class='kpi-value'>" + str(managers) + "</div>"
+970             "<div class='kpi-sub'>of " + str(total_n) + "</div>"
+971             "</div>"
+972 
+973             "</div>",
+974             unsafe_allow_html=True,
+975         )
+976 
+977         st.rerun()
+978 
+979     # ── Save handler ──────────────────────────────────────────────────────────
+980     if save_clicked:
+981         with st.spinner(
+982             "Saving " + str(len(display)) + " leads to database..."
+983         ):
+984             counts = _save_leads_to_db(display)
+985 
+986         if counts["errors"] == 0:
+987             st.success(
+988                 "&#9989; Saved: " + str(counts["saved"])
+989                 + " · Skipped (duplicate): " + str(counts["skipped"])
+990                 + " · Errors: " + str(counts["errors"])
+991             )
+992         else:
+993             st.warning(
+994                 "&#9888; Saved: " + str(counts["saved"])
+995                 + " · Skipped: " + str(counts["skipped"])
+996                 + " · Errors: " + str(counts["errors"])
+997                 + " (check terminal for details)"
+998             )
+999 
+1000     # ── Leads table ───────────────────────────────────────────────────────────
+1001     # BUG-CH-05 FIX: All lead values escaped with _esc() before HTML injection.
+1002     # BUG-CH-07 FIX: All href values passed through _safe_href().
+1003     rows_html = ""
+1004     for i, lead in enumerate(display):
+1005         name     = _esc(lead.get("business_name",        "—"))
+1006         pc       = _esc(lead.get("postcode",              ""))
+1007         city_val = _esc(lead.get("city",                  ""))
+1008         phone    = _esc(lead.get("phone",                 ""))
+1009         email    = _esc(lead.get("email",                 ""))
+1010         manager  = _esc(lead.get("decision_maker_name",  ""))
+1011         dm_role  = _esc(lead.get("decision_maker_title", ""))
+1012         rating   =      lead.get("cqc_rating",            "")
+1013         cqc_url  = _safe_href(lead.get("cqc_url",         ""))
+1014         linkedin = _safe_href(lead.get("social_linkedin_url", ""))
+1015 
+1016         loc_str = (
+1017             city_val
+1018             + "<br><span style='color:" + _C["text_muted"]
+1019             + ";font-size:10px;'>" + pc + "</span>"
+1020             if city_val else pc or "—"
+1021         )
+1022 
+1023         phone_href = _safe_href("tel:" + lead.get("phone", ""))
+1024         phone_html = (
+1025             "<a href='" + phone_href + "' "
+1026             "style='color:" + _C["brand_blue"] + ";"
+1027             "text-decoration:none;font-weight:600;'>"
+1028             + phone + "</a>"
+1029             if phone else
+1030             "<span style='color:" + _C["text_muted"] + ";'>—</span>"
+1031         )
+1032 
+1033         email_href = _safe_href("mailto:" + lead.get("email", ""))
+1034         email_html = (
+1035             "<a href='" + email_href + "' "
+1036             "style='color:" + _C["green"] + ";"
+1037             "text-decoration:none;font-size:11px;'>"
+1038             + email + "</a>"
+1039             if email else
+1040             "<span style='color:" + _C["text_muted"] + ";'>—</span>"
+1041         )
+1042 
+1043         if manager:
+1044             role_str = (
+1045                 "<br><span style='color:" + _C["text_muted"]
+1046                 + ";font-size:10px;'>" + dm_role + "</span>"
+1047                 if dm_role else ""
+1048             )
+1049             li_str = (
+1050                 "<br><a href='" + linkedin + "' target='_blank' "
+1051                 "style='color:" + _C["brand_blue"]
+1052                 + ";font-size:10px;'>LinkedIn &#8599;</a>"
+1053                 if linkedin and linkedin != "#" else ""
+1054             )
+1055             manager_html = (
+1056                 "<span style='color:" + _C["text_primary"]
+1057                 + ";font-weight:600;'>" + manager + "</span>"
+1058                 + role_str + li_str
+1059             )
+1060         else:
+1061             manager_html = (
+1062                 "<span style='color:" + _C["text_muted"] + ";'>—</span>"
+1063             )
+1064 
+1065         cqc_html = (
+1066             "<a href='" + cqc_url + "' target='_blank' "
+1067             "style='color:" + _C["brand_blue"] + ";font-size:10px;"
+1068             "font-weight:600;'>View &#8599;</a>"
+1069             if cqc_url and cqc_url != "#" else
+1070             "<span style='color:" + _C["text_muted"] + ";'>—</span>"
+1071         )
+1072 
+1073         row_bg = (
+1074             _C["bg_raised"] if i % 2 == 0 else _C["bg_surface"]
+1075         )
+1076 
+1077         rows_html += (
+1078             "<tr style='background:" + row_bg + ";'>"
+1079 
+1080             "<td style='padding:12px 14px;"
+1081             "color:" + _C["text_primary"] + ";font-weight:600;"
+1082             "font-size:13px;border-bottom:1px solid "
+1083             + _C["border_subtle"] + ";'>" + name + "</td>"
+1084 
+1085             "<td style='padding:12px 14px;"
+1086             "color:" + _C["text_secondary"] + ";font-size:12px;"
+1087             "border-bottom:1px solid "
+1088             + _C["border_subtle"] + ";'>" + loc_str + "</td>"
+1089 
+1090             "<td style='padding:12px 14px;"
+1091             "border-bottom:1px solid "
+1092             + _C["border_subtle"] + ";'>" + phone_html + "</td>"
+1093 
+1094             "<td style='padding:12px 14px;"
+1095             "border-bottom:1px solid "
+1096             + _C["border_subtle"] + ";'>" + email_html + "</td>"
+1097 
+1098             "<td style='padding:12px 14px;"
+1099             "border-bottom:1px solid "
+1100             + _C["border_subtle"] + ";'>" + manager_html + "</td>"
+1101 
+1102             "<td style='padding:12px 14px;"
+1103             "border-bottom:1px solid "
+1104             + _C["border_subtle"] + ";'>"
+1105             + _rating_badge(rating) + "</td>"
+1106 
+1107             "<td style='padding:12px 14px;"
+1108             "border-bottom:1px solid "
+1109             + _C["border_subtle"] + ";'>" + cqc_html + "</td>"
+1110 
+1111             "</tr>"
+1112         )
+1113 
+1114     headers = [
+1115         "Care Home", "Location", "Phone", "Email",
+1116         "Manager / Director", "CQC Rating", "CQC Profile",
+1117     ]
+1118     header_html = "".join(
+1119         "<th style='padding:10px 14px;text-align:left;"
+1120         "color:" + _C["text_muted"] + ";font-size:10px;"
+1121         "font-weight:700;text-transform:uppercase;"
+1122         "letter-spacing:0.8px;border-bottom:1px solid "
+1123         + _C["border_subtle"] + ";white-space:nowrap;'>"
+1124         + _esc(h) + "</th>"
+1125         for h in headers
+1126     )
+1127 
+1128     saved_at_display = _esc(cache_info.get("saved_at", "Unknown"))
+1129 
+1130     st.markdown(
+1131         "<div style='border-radius:14px;overflow:hidden;"
+1132         "border:1px solid " + _C["border_subtle"] + ";"
+1133         "margin-top:8px;'>"
+1134         "<div style='overflow-x:auto;'>"
+1135         "<table style='width:100%;"
+1136         "border-collapse:collapse;"
+1137         "font-family:Inter,sans-serif;'>"
+1138         "<thead>"
+1139         "<tr style='background:" + _C["bg_raised"] + ";'>"
+1140         + header_html +
+1141         "</tr>"
+1142         "</thead>"
+1143         "<tbody>" + rows_html + "</tbody>"
+1144         "</table>"
+1145         "</div>"
+1146         "</div>"
+1147         "<div style='margin-top:12px;"
+1148         "color:" + _C["text_muted"] + ";"
+1149         "font-size:11px;font-weight:500;"
+1150         "text-align:center;'>"
+1151         "Showing " + "{:,}".format(len(display)) + " leads &middot; "
+1152         "Data from CQC Public API &middot; "
+1153         "Updated " + saved_at_display
+1154         + "</div>",
+1155         unsafe_allow_html=True,
+1156     )

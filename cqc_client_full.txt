@@ -1,0 +1,749 @@
+1 # engine/cqc_client.py — v9.15 (fixed manager name extraction)
+2 #
+3 # CHANGES FROM v9.14:
+4 #   - _extract_manager_name() completely rewritten
+5 #   - Now searches regulatedActivities[].contacts[] (correct CQC structure)
+6 #   - Validates name fields — rejects text blobs and inspection narratives
+7 #   - Shows "Manager Post Vacant" when registeredManagerAbsentDate is set
+8 #   - Shows "Registered Manager" as clean fallback instead of empty/garbage
+9 
+10 import json
+11 import os
+12 import re
+13 import time
+14 import logging
+15 from datetime import datetime
+16 from pathlib import Path
+17 from typing import Dict, Any, List, Optional
+18 from difflib import SequenceMatcher
+19 from dotenv import load_dotenv
+20 
+21 import requests
+22 
+23 load_dotenv()
+24 
+25 logger = logging.getLogger(__name__)
+26 
+27 # ── Configuration ──────────────────────────────────────────────────────────────
+28 
+29 CQC_BASE_URL = os.getenv(
+30     "CQC_BASE_URL",
+31     "https://api.service.cqc.org.uk/public/v1"
+32 )
+33 CQC_WEB_BASE  = "https://www.cqc.org.uk"
+34 CQC_API_KEY   = os.getenv("CQC_API_KEY", "")
+35 CQC_CACHE_FILE = Path("engine/cqc_location_cache.json")
+36 
+37 # Rate limiting — 2 seconds between requests
+38 _REQUEST_INTERVAL = 2.0
+39 _last_request_at  = 0.0
+40 
+41 # In-memory cache — loaded once per process
+42 _cache_locations: Optional[List[Dict]] = None
+43 
+44 
+45 # ── Internal helpers ───────────────────────────────────────────────────────────
+46 
+47 def _throttle() -> None:
+48     """Enforce minimum gap between API requests."""
+49     global _last_request_at
+50     elapsed = time.time() - _last_request_at
+51     if elapsed < _REQUEST_INTERVAL:
+52         time.sleep(_REQUEST_INTERVAL - elapsed)
+53     _last_request_at = time.time()
+54 
+55 
+56 def _get_headers() -> Dict[str, str]:
+57     """
+58     Build request headers.
+59     API key is ALWAYS included — mandated on every request.
+60     """
+61     headers = {
+62         "Accept":     "application/json",
+63         "User-Agent": "KNCS-LeadGen/9.15",
+64     }
+65     if CQC_API_KEY:
+66         headers["Ocp-Apim-Subscription-Key"] = CQC_API_KEY
+67     return headers
+68 
+69 
+70 def _get(path: str,
+71          params: Optional[Dict] = None) -> Optional[Dict]:
+72     """
+73     GET request to CQC API.
+74     Returns parsed JSON dict or None on any failure.
+75     Never raises.
+76     """
+77     try:
+78         _throttle()
+79         url  = f"{CQC_BASE_URL}{path}"
+80         resp = requests.get(
+81             url,
+82             headers=_get_headers(),
+83             params=params,
+84             timeout=15,
+85         )
+86 
+87         if resp.status_code == 200:
+88             return resp.json()
+89 
+90         try:
+91             body_preview = resp.text[:300] if resp.text else "(empty)"
+92         except Exception:
+93             body_preview = "(unreadable)"
+94 
+95         logger.warning(
+96             "CQC API %s -> HTTP %s | body: %s",
+97             path, resp.status_code, body_preview,
+98         )
+99         return None
+100 
+101     except Exception as exc:
+102         logger.warning("CQC API error (%s): %s", path, exc)
+103         return None
+104 
+105 
+106 def _load_cache() -> List[Dict]:
+107     """
+108     Load local CQC location cache into memory.
+109     Returns list of location dicts.
+110     Returns empty list if cache file missing or corrupt.
+111     Caches result in module-level _cache_locations.
+112     """
+113     global _cache_locations
+114 
+115     if _cache_locations is not None:
+116         return _cache_locations
+117 
+118     if not CQC_CACHE_FILE.exists():
+119         logger.warning(
+120             "CQC cache file not found: %s — "
+121             "run refresh_cqc_cache() first",
+122             CQC_CACHE_FILE,
+123         )
+124         _cache_locations = []
+125         return _cache_locations
+126 
+127     try:
+128         with open(CQC_CACHE_FILE, "r", encoding="utf-8") as f:
+129             data = json.load(f)
+130 
+131         # Cache file stores full locations list
+132         _cache_locations = data.get("locations", [])
+133         logger.info(
+134             "CQC cache loaded: %s locations from %s",
+135             len(_cache_locations), CQC_CACHE_FILE,
+136         )
+137         return _cache_locations
+138 
+139     except Exception as exc:
+140         logger.warning("CQC cache load failed: %s", exc)
+141         _cache_locations = []
+142         return _cache_locations
+143 
+144 
+145 def _reload_cache() -> None:
+146     """Force reload of cache from disk — call after refresh_cqc_cache()."""
+147     global _cache_locations
+148     _cache_locations = None
+149     _load_cache()
+150 
+151 
+152 def _similarity(a: str, b: str) -> float:
+153     """SequenceMatcher ratio — 0.0 to 1.0."""
+154     if not a or not b:
+155         return 0.0
+156     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+157 
+158 
+159 def _clean_name_for_search(business_name: str) -> str:
+160     """
+161     Strip generic care-home words before matching.
+162     Keeps meaningful tokens — improves match accuracy.
+163     """
+164     noise = {
+165         "care", "home", "lodge", "manor", "court",
+166         "hall", "residential", "nursing", "the",
+167     }
+168     tokens  = business_name.lower().split()
+169     cleaned = " ".join(t for t in tokens if t not in noise)
+170     return cleaned.strip() or business_name.lower()
+171 
+172 
+173 def _score_candidate(business_name: str,
+174                      city: str,
+175                      candidate: Dict) -> float:
+176     """
+177     Score a single CQC candidate against our search terms.
+178     Returns float 0.0-1.0+ (city bonus can push above 1.0).
+179     """
+180     cand_name = candidate.get("locationName", "")
+181     cand_city = (
+182         candidate.get("postalAddressTownCity", "")
+183         or candidate.get("postalCode", "")
+184         or ""
+185     ).lower().strip()
+186 
+187     search_cleaned = _clean_name_for_search(business_name)
+188     cand_cleaned   = _clean_name_for_search(cand_name)
+189 
+190     base_score = _similarity(search_cleaned, cand_cleaned)
+191 
+192     search_words = set(search_cleaned.split())
+193     cand_words   = set(cand_cleaned.split())
+194     shared       = search_words & cand_words
+195     word_bonus   = 0.0
+196     if search_words and shared:
+197         word_bonus = 0.2 * len(shared) / len(search_words)
+198 
+199     city_bonus = 0.0
+200     if city and cand_city:
+201         if city.lower().strip() in cand_city:
+202             city_bonus = 0.2
+203 
+204     return base_score + word_bonus + city_bonus
+205 
+206 
+207 def _search_candidates(business_name: str,
+208                         city: str) -> List[Dict]:
+209     """
+210     Search for CQC location candidates by name.
+211 
+212     v9.15:
+213       The CQC /locations API does not support any name search
+214       filter — all name filters return HTTP 400.
+215 
+216       Strategy:
+217         1. Search local cache file by name similarity (fast, no API)
+218         2. If cache empty/missing: return empty list with warning
+219            (user must run Download CQC Database first)
+220 
+221       Returns top 10 candidates scored by name similarity.
+222     """
+223     locations = _load_cache()
+224 
+225     if not locations:
+226         logger.warning(
+227             "CQC cache empty — cannot search for '%s'. "
+228             "Click 'Download CQC Database' on Care Homes page first.",
+229             business_name,
+230         )
+231         return []
+232 
+233     search_cleaned = _clean_name_for_search(business_name)
+234     city_lower     = city.lower().strip() if city else ""
+235 
+236     scored: List[tuple] = []
+237 
+238     for loc in locations:
+239         loc_name    = loc.get("locationName", "")
+240         loc_cleaned = _clean_name_for_search(loc_name)
+241 
+242         # Quick pre-filter — skip if no word overlap at all
+243         search_words = set(search_cleaned.split())
+244         loc_words    = set(loc_cleaned.split())
+245         if search_words and not (search_words & loc_words):
+246             # Allow through if similarity still high
+247             sim = _similarity(search_cleaned, loc_cleaned)
+248             if sim < 0.4:
+249                 continue
+250 
+251         score = _score_candidate(business_name, city, loc)
+252         if score > 0.2:
+253             scored.append((score, loc))
+254 
+255     # Sort by score descending, return top 10
+256     scored.sort(key=lambda x: x[0], reverse=True)
+257     return [loc for _, loc in scored[:10]]
+258 
+259 
+260 def _get_location_detail(location_id: str) -> Optional[Dict]:
+261     """
+262     Fetch full location detail record from CQC API.
+263     API key required.
+264     """
+265     if not location_id:
+266         return None
+267     return _get(f"/locations/{location_id}")
+268 
+269 
+270 def _extract_manager_name(detail: Dict) -> str:
+271     """
+272     Pull registered manager name from CQC location detail.
+273 
+274     CQC API structure confirmed from live response analysis:
+275       - Top-level 'contacts' field does NOT exist on most records
+276       - Contacts are nested inside regulatedActivities[].contacts[]
+277       - Each contact has: firstName, familyName, personTitle, roles[]
+278       - registeredManagerAbsentDate signals vacant manager post
+279 
+280     Validation rules applied to every candidate name:
+281       - Must be a dict (not a text blob or inspection narrative)
+282       - Length between 2 and 50 characters
+283       - Must not be all lowercase (inspection text is all lowercase)
+284 
+285     Returns:
+286       - Full name string if found
+287       - "Manager Post Vacant" if registeredManagerAbsentDate is set
+288       - "Registered Manager" as clean generic fallback
+289     """
+290 
+291     # ── Strategy 1: regulatedActivities[].contacts[] ──────────────────────────
+292     # This is the correct CQC structure confirmed from live API response.
+293     regulated = detail.get("regulatedActivities", [])
+294     if isinstance(regulated, list):
+295         for activity in regulated:
+296             contacts = activity.get("contacts", [])
+297             if not isinstance(contacts, list):
+298                 continue
+299             for contact in contacts:
+300                 # Must be a dict — reject text blobs immediately
+301                 if not isinstance(contact, dict):
+302                     continue
+303                 first = (contact.get("firstName", "") or "").strip()
+304                 last  = (contact.get("familyName", "") or "").strip()
+305                 name  = f"{first} {last}".strip()
+306                 # Validate: real name is 2-50 chars
+307                 # All-lowercase check rejects inspection narrative text
+308                 if name and 2 <= len(name) <= 50 and not name.islower():
+309                     return name
+310 
+311     # ── Strategy 2: top-level contacts[] ──────────────────────────────────────
+312     # Some location types do have top-level contacts. Check as fallback.
+313     top_contacts = detail.get("contacts", [])
+314     if isinstance(top_contacts, list):
+315         for contact in top_contacts:
+316             if not isinstance(contact, dict):
+317                 continue
+318             first = (contact.get("firstName", "") or "").strip()
+319             last  = (contact.get("familyName", "") or "").strip()
+320             name  = f"{first} {last}".strip()
+321             if name and 2 <= len(name) <= 50 and not name.islower():
+322                 return name
+323 
+324     # ── Strategy 3: registeredManagerAbsentDate signal ────────────────────────
+325     # CQC sets this field when the manager post is vacant.
+326     # Better to show this than a blank or garbage text.
+327     absent_date = detail.get("registeredManagerAbsentDate", "")
+328     if absent_date:
+329         return "Manager Post Vacant"
+330 
+331     # ── Strategy 4: clean generic fallback ────────────────────────────────────
+332     # Never return empty string or raw inspection text.
+333     return "Registered Manager"
+334 
+335 
+336 def _extract_rating(detail: Dict) -> str:
+337     """
+338     Extract overall CQC inspection rating.
+339     """
+340     ratings = detail.get("currentRatings", {})
+341     if not isinstance(ratings, dict):
+342         return ""
+343     overall = ratings.get("overall", {})
+344     if not isinstance(overall, dict):
+345         return ""
+346     return overall.get("rating", "")
+347 
+348 
+349 def _build_address(detail: Dict) -> str:
+350     """
+351     Build clean single-line address from CQC flat fields.
+352     """
+353     parts = [
+354         detail.get("postalAddressLine1",    "") or "",
+355         detail.get("postalAddressLine2",    "") or "",
+356         detail.get("postalAddressTownCity", "") or "",
+357         detail.get("postalCode",            "") or "",
+358     ]
+359     return ", ".join(p.strip() for p in parts if p.strip())
+360 
+361 
+362 def _scrape_location_page(location_id: str,
+363                            result: Dict[str, Any]) -> None:
+364     """
+365     Fallback: scrape the CQC public web page for this location.
+366     Used when API does not return a manager name.
+367     """
+368     try:
+369         url  = f"{CQC_WEB_BASE}/location/{location_id}"
+370         resp = requests.get(
+371             url,
+372             timeout=15,
+373             headers={"User-Agent": "Mozilla/5.0"},
+374         )
+375         if resp.status_code != 200:
+376             return
+377 
+378         page_text = resp.text
+379 
+380         patterns = [
+381             r"Registered Manager\s*[:\-]?\s*"
+382             r"([A-Z][a-zA-Z\s\'\-]{2,40})",
+383             r"Manager\s*[:\-]?\s*"
+384             r"([A-Z][a-zA-Z\s\'\-]{2,40})",
+385             r"Nominated Individual\s*[:\-]?\s*"
+386             r"([A-Z][a-zA-Z\s\'\-]{2,40})",
+387         ]
+388         for pattern in patterns:
+389             match = re.search(pattern, page_text, re.IGNORECASE)
+390             if match:
+391                 name = match.group(1).strip()
+392                 if len(name) > 3:
+393                     result["registered_manager"] = name
+394                     result["match_confidence"]    = "high"
+395                     result["source"]              = "cqc_website"
+396                     break
+397 
+398         if not result["phone"]:
+399             phone_match = re.search(
+400                 r"Telephone\s*[:\-]?\s*([0-9\s()\+]{8,20})",
+401                 page_text,
+402                 re.IGNORECASE,
+403             )
+404             if phone_match:
+405                 result["phone"] = phone_match.group(1).strip()
+406 
+407         if not result["cqc_rating"]:
+408             rating_match = re.search(
+409                 r"(Outstanding|Good|"
+410                 r"Requires\s+improvement|Inadequate)",
+411                 page_text,
+412                 re.IGNORECASE,
+413             )
+414             if rating_match:
+415                 result["cqc_rating"] = rating_match.group(1).strip()
+416 
+417     except Exception:
+418         pass
+419 
+420 
+421 # ── Public function — called by enricher.py ───────────────────────────────────
+422 
+423 def lookup_cqc_location(
+424     business_name: str,
+425     city:          str = "",
+426     address:       str = "",
+427 ) -> Dict[str, Any]:
+428     """
+429     Look up a UK care home by name using local cache + API detail fetch.
+430 
+431     Called by engine/enricher.py ONLY when:
+432       - country == "United Kingdom"
+433       - niche   == "care home"
+434 
+435     Requires local cache — run refresh_cqc_cache() first.
+436     Never raises.
+437     """
+438     empty: Dict[str, Any] = {
+439         "registered_manager": "",
+440         "phone":              "",
+441         "address":            "",
+442         "cqc_rating":         "",
+443         "cqc_url":            "",
+444         "cqc_location_id":    "",
+445         "match_confidence":   "none",
+446         "source":             "",
+447     }
+448 
+449     if not business_name or not business_name.strip():
+450         return empty
+451 
+452     try:
+453         candidates = _search_candidates(business_name, city)
+454         if not candidates:
+455             logger.debug(
+456                 "CQC: no results for '%s' / '%s'",
+457                 business_name, city,
+458             )
+459             return empty
+460 
+461         best       = None
+462         best_score = 0.0
+463 
+464         for candidate in candidates:
+465             score = _score_candidate(business_name, city, candidate)
+466             if score > best_score:
+467                 best_score = score
+468                 best       = candidate
+469 
+470         if not best or best_score < 0.3:
+471             logger.debug(
+472                 "CQC: no confident match for '%s' (best=%.2f)",
+473                 business_name, best_score,
+474             )
+475             return empty
+476 
+477         if best_score >= 0.8:
+478             confidence = "high"
+479         elif best_score >= 0.5:
+480             confidence = "medium"
+481         else:
+482             confidence = "low"
+483 
+484         location_id = best.get("locationId", "")
+485         cqc_url     = (
+486             f"{CQC_WEB_BASE}/location/{location_id}"
+487             if location_id else ""
+488         )
+489 
+490         result: Dict[str, Any] = {
+491             "registered_manager": "",
+492             "phone":              "",
+493             "address":            "",
+494             "cqc_rating":         "",
+495             "cqc_url":            cqc_url,
+496             "cqc_location_id":    location_id,
+497             "match_confidence":   confidence,
+498             "source":             "cqc_api",
+499         }
+500 
+501         detail = _get_location_detail(location_id)
+502 
+503         if detail:
+504             result["registered_manager"] = _extract_manager_name(detail)
+505             result["cqc_rating"]         = _extract_rating(detail)
+506             result["phone"]              = str(
+507                 detail.get("mainPhoneNumber", "") or ""
+508             ).strip()
+509             result["address"]            = _build_address(detail)
+510 
+511         if not result["registered_manager"] and location_id:
+512             _scrape_location_page(location_id, result)
+513 
+514         logger.info(
+515             "CQC match: '%s' -> '%s' | manager=%s | "
+516             "rating=%s | confidence=%s",
+517             business_name,
+518             best.get("locationName", ""),
+519             result["registered_manager"] or "not found",
+520             result["cqc_rating"]         or "not rated",
+521             confidence,
+522         )
+523 
+524         return result
+525 
+526     except Exception as exc:
+527         logger.error(
+528             "CQC lookup failed for '%s': %s",
+529             business_name, exc,
+530         )
+531         return empty
+532 
+533 
+534 # ── Public function — called by care_home_dashboard.py ───────────────────────
+535 
+536 def refresh_cqc_cache() -> bool:
+537     """
+538     Download all CQC locations and save to local cache file.
+539     After download, reloads in-memory cache automatically.
+540 
+541     Returns True on success, False on failure. Never raises.
+542     """
+543     try:
+544         logger.info("refresh_cqc_cache: starting CQC location download")
+545 
+546         # Step 1: probe
+547         probe = _get("/locations", params={
+548             "page":    1,
+549             "perPage": 1,
+550         })
+551 
+552         if probe is None:
+553             logger.error(
+554                 "refresh_cqc_cache: CQC API probe failed. "
+555                 "Check CQC_API_KEY in .env"
+556             )
+557             return False
+558 
+559         total_count = probe.get("total", 0)
+560         logger.info(
+561             "refresh_cqc_cache: %s total locations to download",
+562             total_count,
+563         )
+564 
+565         # Step 2: paginated download
+566         all_locations: List[Dict] = []
+567         page     = 1
+568         per_page = 100
+569 
+570         if total_count:
+571             total_pages = max(1, (total_count + per_page - 1) // per_page)
+572         else:
+573             total_pages = 9999
+574 
+575         while page <= total_pages:
+576             data = _get("/locations", params={
+577                 "page":    page,
+578                 "perPage": per_page,
+579             })
+580 
+581             if data is None:
+582                 logger.warning(
+583                     "refresh_cqc_cache: page %s failed — stopping",
+584                     page,
+585                 )
+586                 break
+587 
+588             locations = data.get("locations", [])
+589 
+590             if not locations:
+591                 logger.info(
+592                     "refresh_cqc_cache: page %s empty — done", page
+593                 )
+594                 break
+595 
+596             if page == 1 and data.get("total"):
+597                 total_count = data["total"]
+598                 total_pages = max(
+599                     1,
+600                     (total_count + per_page - 1) // per_page
+601                 )
+602                 logger.info(
+603                     "refresh_cqc_cache: %s locations / %s pages confirmed",
+604                     total_count, total_pages,
+605                 )
+606 
+607             all_locations.extend(locations)
+608 
+609             logger.info(
+610                 "refresh_cqc_cache: page %s/%s — %s so far",
+611                 page, total_pages, len(all_locations),
+612             )
+613 
+614             page += 1
+615 
+616             if page > 1500:
+617                 logger.warning("refresh_cqc_cache: safety cap at 1500 pages")
+618                 break
+619 
+620         if not all_locations:
+621             logger.error("refresh_cqc_cache: no locations downloaded")
+622             return False
+623 
+624         # Step 3: filter care homes client-side
+625         care_home_types = {
+626             "Care home service",
+627             "Care home service with nursing",
+628             "Residential care home",
+629             "Nursing home",
+630         }
+631 
+632         care_homes = [
+633             loc for loc in all_locations
+634             if loc.get("type", "") in care_home_types
+635             or loc.get("careHome", "") == "Y"
+636             or "care home" in loc.get("type", "").lower()
+637         ]
+638 
+639         logger.info(
+640             "refresh_cqc_cache: %s care homes from %s total",
+641             len(care_homes), len(all_locations),
+642         )
+643 
+644         # Step 4: save cache
+645         cache_data = {
+646             "saved_at":         datetime.utcnow().isoformat() + "Z",
+647             "total_locations":  len(all_locations),
+648             "total_care_homes": len(care_homes),
+649             "locations":        all_locations,
+650             "care_homes":       care_homes,
+651         }
+652 
+653         CQC_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+654 
+655         with open(CQC_CACHE_FILE, "w", encoding="utf-8") as f:
+656             json.dump(cache_data, f, ensure_ascii=False, indent=2)
+657 
+658         logger.info(
+659             "refresh_cqc_cache: saved %s locations (%s care homes) to %s",
+660             len(all_locations), len(care_homes), CQC_CACHE_FILE,
+661         )
+662 
+663         # Step 5: reload in-memory cache
+664         _reload_cache()
+665 
+666         return True
+667 
+668     except Exception as exc:
+669         logger.error(
+670             "refresh_cqc_cache: unexpected error: %s", exc,
+671             exc_info=True,
+672         )
+673         return False
+674 
+675 
+676 # ── Diagnostic helper ─────────────────────────────────────────────────────────
+677 
+678 def test_cqc_connection() -> None:
+679     """
+680     Run from terminal:
+681         python -c "from engine.cqc_client import test_cqc_connection; test_cqc_connection()"
+682     """
+683     logging.basicConfig(level=logging.INFO)
+684     print("\n── CQC API Connection Test ──────────────────────")
+685     print(f"Base URL : {CQC_BASE_URL}")
+686     print(
+687         f"API Key  : "
+688         f"{'SET (' + CQC_API_KEY[:6] + '...)' if CQC_API_KEY else 'NOT SET'}"
+689     )
+690     print(f"Cache    : {CQC_CACHE_FILE} "
+691           f"({'exists' if CQC_CACHE_FILE.exists() else 'MISSING — run Download first'})")
+692     print()
+693 
+694     if not CQC_API_KEY:
+695         print("  No API key. Set CQC_API_KEY in .env")
+696         return
+697 
+698     # Test 1 — basic connectivity
+699     print("Test 1: Basic connectivity (with API key) ...")
+700     result = _get("/locations", params={"page": 1, "perPage": 1})
+701     if result:
+702         print(f"  OK — total locations: {result.get('total', 'unknown')}")
+703     else:
+704         print("  FAILED")
+705 
+706     # Test 2 — page size 100
+707     print("Test 2: Page size 100 ...")
+708     result2 = _get("/locations", params={"page": 1, "perPage": 100})
+709     if result2:
+710         count = len(result2.get("locations", []))
+711         print(f"  OK — returned {count} locations")
+712     else:
+713         print("  FAILED")
+714 
+715     # Test 3 — cache search
+716     print("Test 3: Cache name search ...")
+717     if CQC_CACHE_FILE.exists():
+718         candidates = _search_candidates("Ashby Lodge", "Nuneaton")
+719         if candidates:
+720             print(f"  OK — found {len(candidates)} candidates")
+721             for c in candidates[:3]:
+722                 print(f"       {c.get('locationName')} — {c.get('postalCode')}")
+723         else:
+724             print("  Cache exists but no matches — cache may need refresh")
+725     else:
+726         print("  SKIPPED — cache file missing")
+727         print("       Run: refresh_cqc_cache() or click Download on Care Homes page")
+728 
+729     # Test 4 — individual location detail
+730     print("Test 4: Individual location detail ...")
+731     result4 = _get("/locations/1-10000302982")
+732     if result4:
+733         name = result4.get("name", result4.get("locationName", "unknown"))
+734         print(f"  OK — location: {name}")
+735     else:
+736         print("  FAILED")
+737 
+738     print("\n── End Test ─────────────────────────────────────\n")
+739 
+740 
+741 # ── Manual test ───────────────────────────────────────────────────────────────
+742 
+743 if __name__ == "__main__":
+744     logging.basicConfig(level=logging.INFO)
+745     test_cqc_connection()
+746     print("\nTesting lookup_cqc_location ...")
+747     r = lookup_cqc_location("Ashby Lodge Care Home", "Nuneaton")
+748     for k, v in r.items():
+749         print(f"  {k}: {v}")

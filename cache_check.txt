@@ -1,0 +1,10 @@
+TOP LEVEL KEYS:
+  saved_at
+  total_locations
+  total_care_homes
+  locations
+  care_homes
+LOCATIONS COUNT: 121704
+CARE_HOMES COUNT: 0
+TOTAL_CARE_HOMES KEY: 0
+FIRST LOC KEYS: ['locationId', 'locationName', 'postalCode']

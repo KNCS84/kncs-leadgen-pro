@@ -1,0 +1,1789 @@
+1 # engine/enricher.py
+2 # KNCS LeadGen Pro — v9.9
+3 # Base: v9.7 PREMIUM + UK CARE HOME EDITION
+4 # v9.9 changes (marked ── v9.9 FIX):
+5 #   1. cqc_location_id now written to lead dict
+6 #   2. dm_source uses correct field name and correct value ("cqc")
+7 #   3. decision_maker_confidence removed (not in schema)
+8 #   4. CQC condition now checks BOTH country AND niche (care home only)
+9 #   5. Empty country no longer triggers CQC
+10 #   6. _enrich_from_cqc() returns fields_added count — fixes
+11 #      the cqc_result != lead comparison problem
+12 #   7. DM name stored clean — title not embedded in name field
+13 #   8. dm_source set when name found from website
+14 #   9. reenrich UPDATE SQL includes all 4 new v9.9 columns
+15 
+16 from __future__ import annotations
+17 
+18 import json
+19 import re
+20 import time
+21 import random
+22 import logging
+23 from datetime import datetime, timezone
+24 from typing import Optional
+25 from urllib.parse import urlparse, urljoin
+26 
+27 import requests
+28 from bs4 import BeautifulSoup
+29 
+30 logger = logging.getLogger(__name__)
+31 
+32 __all__ = [
+33     "enrich_lead",
+34     "find_email_multi_source",
+35     "find_phone_multi_source",
+36     "get_contact_completeness",
+37     "discover_business_website",
+38     "reenrich_leads_missing_emails",
+39 ]
+40 
+41 # ─────────────────────────────────────────────────────────
+42 # CQC Integration (optional — fails gracefully if missing)
+43 # ─────────────────────────────────────────────────────────
+44 
+45 try:
+46     from engine.cqc_client import lookup_cqc_location
+47     _CQC_AVAILABLE = True
+48 except ImportError:
+49     _CQC_AVAILABLE = False
+50     logger.info(
+51         "CQC module not available — "
+52         "UK care home enrichment via web only"
+53     )
+54 
+55     def lookup_cqc_location(*args, **kwargs):
+56         return {
+57             "registered_manager": "",
+58             "phone":              "",
+59             "address":            "",
+60             "cqc_rating":         "",
+61             "cqc_url":            "",
+62             "cqc_location_id":    "",
+63             "match_confidence":   "none",
+64             "source":             "",
+65         }
+66 
+67 # ─────────────────────────────────────────────────────────
+68 # DuckDuckGo Search (DDGS package preferred, raw HTTP fallback)
+69 # ─────────────────────────────────────────────────────────
+70 
+71 try:
+72     from duckduckgo_search import DDGS
+73     _DDGS_AVAILABLE = True
+74 except ImportError:
+75     _DDGS_AVAILABLE = False
+76     logger.info(
+77         "duckduckgo-search package not available — "
+78         "using raw HTTP fallback"
+79     )
+80 
+81 # ─────────────────────────────────────────────────────────
+82 # Headers pool
+83 # ─────────────────────────────────────────────────────────
+84 
+85 HEADERS_POOL = [
+86     {
+87         "User-Agent": (
+88             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+89             "AppleWebKit/537.36 (KHTML, like Gecko) "
+90             "Chrome/124.0.0.0 Safari/537.36"
+91         ),
+92         "Accept": (
+93             "text/html,application/xhtml+xml,"
+94             "application/xml;q=0.9,*/*;q=0.8"
+95         ),
+96         "Accept-Language": "en-US,en;q=0.9",
+97         "Accept-Encoding": "gzip, deflate, br",
+98         "Connection": "keep-alive",
+99         "Cache-Control": "max-age=0",
+100     },
+101     {
+102         "User-Agent": (
+103             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+104             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+105             "Version/17.4 Safari/605.1.15"
+106         ),
+107         "Accept": (
+108             "text/html,application/xhtml+xml,"
+109             "application/xml;q=0.9,*/*;q=0.8"
+110         ),
+111         "Accept-Language": "en-GB,en;q=0.9",
+112         "Connection": "keep-alive",
+113     },
+114     {
+115         "User-Agent": (
+116             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+117             "Gecko/20100101 Firefox/125.0"
+118         ),
+119         "Accept": (
+120             "text/html,application/xhtml+xml,"
+121             "application/xml;q=0.9,*/*;q=0.8"
+122         ),
+123         "Accept-Language": "en-US,en;q=0.7",
+124         "Connection": "keep-alive",
+125     },
+126 ]
+127 
+128 JUNK_EMAIL_PATTERNS = [
+129     "example", "test@", "noreply", "no-reply",
+130     "donotreply", "schema.org", "w3.org", "sentry",
+131     ".png", ".jpg", ".jpeg", ".gif", ".webp",
+132     "support@b2b", "jane.doe", "john.doe", "jdoe",
+133     "jane@", "john@", "user@", "admin@example",
+134     "info@example", "hello@example",
+135     "test@test", "email@email",
+136     "yourname@", "youremail@",
+137     "name@domain", "sample@",
+138 ]
+139 
+140 SEARCH_ENGINE_DOMAINS = [
+141     "google.com", "bing.com", "yahoo.com",
+142     "duckduckgo.com", "baidu.com", "ask.com",
+143     "w3.org", "schema.org", "wikipedia.org",
+144     "facebook.com", "twitter.com", "instagram.com",
+145     "linkedin.com", "youtube.com",
+146 ]
+147 
+148 SEARCH_ENGINE_DOMAINS_EXTENDED = [
+149     "google.com", "bing.com", "yahoo.com",
+150     "duckduckgo.com", "facebook.com",
+151     "instagram.com", "linkedin.com",
+152     "twitter.com", "x.com", "youtube.com",
+153     "wikipedia.org", "yelp.com",
+154     "yellowpages.com", "whitepages.com",
+155     "bbb.org", "manta.com", "hotfrog.com",
+156 ]
+157 
+158 _NAME_IGNORE_WORDS = {
+159     "inc", "llc", "ltd", "limited", "company", "corp",
+160     "corporation", "services", "group", "holdings",
+161     "solutions", "the", "and", "for",
+162     "nigeria", "nigerian", "nig", "ent", "enterprises",
+163     "associates", "global", "prime", "galaxy", "alpha",
+164     "omega", "royal", "premier", "elite", "supreme",
+165     "mega", "macro", "micro", "inter", "integrated",
+166 }
+167 
+168 
+169 def get_headers() -> dict:
+170     return random.choice(HEADERS_POOL)
+171 
+172 
+173 def human_pause(min_s: float = 0.5, max_s: float = 1.5):
+174     time.sleep(random.uniform(min_s, max_s))
+175 
+176 
+177 # ─────────────────────────────────────────────────────────
+178 # Domain helpers
+179 # ─────────────────────────────────────────────────────────
+180 
+181 def normalize_domain(url: str) -> str:
+182     if not url:
+183         return ""
+184     try:
+185         if not url.startswith("http"):
+186             url = "https://" + url
+187         parsed = urlparse(url)
+188         domain = parsed.netloc.lower().replace("www.", "")
+189         return domain.strip("/")
+190     except Exception:
+191         return ""
+192 
+193 
+194 def is_bad_domain(domain: str) -> bool:
+195     if not domain:
+196         return True
+197     domain = domain.lower()
+198     for bad in SEARCH_ENGINE_DOMAINS_EXTENDED:
+199         if domain == bad or domain.endswith("." + bad):
+200             return True
+201     return False
+202 
+203 
+204 def extract_domains_from_html(html: str) -> list:
+205     if not html:
+206         return []
+207     pattern = r'https?://([a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,})'
+208     matches = re.findall(pattern, html)
+209     domains = []
+210     seen: set = set()
+211     for d in matches:
+212         d = d.lower().replace("www.", "")
+213         if d not in seen:
+214             seen.add(d)
+215             domains.append(d)
+216     return domains
+217 
+218 
+219 def business_name_tokens(name: str) -> list:
+220     if not name:
+221         return []
+222     words = re.findall(r"[a-zA-Z]{4,}", name.lower())
+223     return [w for w in words if w not in _NAME_IGNORE_WORDS]
+224 
+225 
+226 def score_domain_relevance(domain: str, business_name: str) -> int:
+227     if not domain:
+228         return 0
+229     score = 0
+230     domain = domain.lower()
+231     tokens = business_name_tokens(business_name)
+232     root = domain.split(".")[0]
+233     for token in tokens:
+234         if len(token) < 4:
+235             continue
+236         if token == root:
+237             score += 100
+238         elif token in root:
+239             score += 40
+240         elif root in token:
+241             score += 20
+242     return score
+243 
+244 
+245 # ─────────────────────────────────────────────────────────
+246 # Website discovery
+247 # ─────────────────────────────────────────────────────────
+248 
+249 def discover_business_website_duckduckgo(
+250     business_name: str,
+251     location: str = "",
+252 ) -> str:
+253     if _DDGS_AVAILABLE:
+254         try:
+255             query = f'"{business_name}" {location} website'.strip()
+256             with DDGS() as ddgs:
+257                 results = ddgs.text(query, max_results=10)
+258                 for r in results:
+259                     url = r.get("href", "")
+260                     domain = normalize_domain(url)
+261                     if domain and not is_bad_domain(domain):
+262                         score = score_domain_relevance(
+263                             domain, business_name
+264                         )
+265                         if score > 0:
+266                             logger.info(
+267                                 "DDGS website found: %s", domain
+268                             )
+269                             return "https://" + domain
+270         except Exception as exc:
+271             logger.debug(
+272                 "DDGS search failed, falling back: %s", exc
+273             )
+274 
+275     try:
+276         query = f'"{business_name}" {location} website'.strip()
+277         url = (
+278             "https://html.duckduckgo.com/html/?q="
+279             + query.replace(" ", "+")
+280         )
+281         human_pause(0.8, 1.5)
+282         resp = requests.get(url, headers=get_headers(), timeout=15)
+283         if resp.status_code != 200:
+284             return ""
+285         domains = extract_domains_from_html(resp.text)
+286         scored = []
+287         for domain in domains:
+288             if is_bad_domain(domain):
+289                 continue
+290             score = score_domain_relevance(domain, business_name)
+291             if score > 0:
+292                 scored.append((domain, score))
+293         if not scored:
+294             return ""
+295         scored.sort(key=lambda x: x[1], reverse=True)
+296         best = scored[0][0]
+297         logger.info("DDG website found: %s", best)
+298         return "https://" + best
+299     except Exception as exc:
+300         logger.debug(
+301             "discover_business_website_duckduckgo error: %s", exc
+302         )
+303         return ""
+304 
+305 
+306 def discover_business_website_bing(
+307     business_name: str,
+308     location: str = "",
+309 ) -> str:
+310     try:
+311         query = (
+312             f'"{business_name}" {location} official website'.strip()
+313         )
+314         url = (
+315             "https://www.bing.com/search?q="
+316             + query.replace(" ", "+")
+317         )
+318         human_pause(0.8, 1.5)
+319         resp = requests.get(url, headers=get_headers(), timeout=15)
+320         if resp.status_code != 200:
+321             return ""
+322         domains = extract_domains_from_html(resp.text)
+323         scored = []
+324         for domain in domains:
+325             if is_bad_domain(domain):
+326                 continue
+327             score = score_domain_relevance(domain, business_name)
+328             if score > 0:
+329                 scored.append((domain, score))
+330         if not scored:
+331             return ""
+332         scored.sort(key=lambda x: x[1], reverse=True)
+333         best = scored[0][0]
+334         logger.info("Bing website found: %s", best)
+335         return "https://" + best
+336     except Exception as exc:
+337         logger.debug(
+338             "discover_business_website_bing error: %s", exc
+339         )
+340         return ""
+341 
+342 
+343 def discover_business_website(
+344     business_name: str,
+345     location: str = "",
+346 ) -> tuple:
+347     website = discover_business_website_duckduckgo(
+348         business_name, location
+349     )
+350     if website:
+351         return website, "duckduckgo"
+352 
+353     website = discover_business_website_bing(business_name, location)
+354     if website:
+355         return website, "bing"
+356 
+357     return "", ""
+358 
+359 
+360 # ─────────────────────────────────────────────────────────
+361 # Email validation
+362 # ─────────────────────────────────────────────────────────
+363 
+364 def is_junk_email(email: str) -> bool:
+365     if not email or "@" not in email:
+366         return True
+367     email_lower = email.lower()
+368     for pattern in JUNK_EMAIL_PATTERNS:
+369         if pattern in email_lower:
+370             return True
+371     domain = email_lower.split("@")[-1]
+372     for bad_domain in SEARCH_ENGINE_DOMAINS:
+373         if domain == bad_domain or domain.endswith("." + bad_domain):
+374             return True
+375     return False
+376 
+377 
+378 def email_matches_business(
+379     email: str,
+380     business_name: str,
+381     website: str = None,
+382 ) -> bool:
+383     if not email or "@" not in email:
+384         return False
+385     email_lower = email.lower()
+386     local_part, domain = email_lower.split("@", 1)
+387     if website:
+388         try:
+389             site_domain = urlparse(
+390                 website
+391                 if website.startswith("http")
+392                 else "https://" + website
+393             ).netloc.lower().replace("www.", "")
+394             email_domain = domain.replace("www.", "")
+395             if site_domain and site_domain == email_domain:
+396                 return True
+397             site_root = site_domain.split(".")[0]
+398             if (
+399                 site_root
+400                 and len(site_root) > 3
+401                 and site_root in email_domain
+402             ):
+403                 return True
+404         except Exception:
+405             pass
+406     if business_name:
+407         words = re.findall(r"[a-zA-Z]{4,}", business_name.lower())
+408         for word in words:
+409             if word in domain or word in local_part:
+410                 return True
+411     return False
+412 
+413 
+414 def score_email_confidence(
+415     email: str,
+416     business_name: str,
+417     website: str = None,
+418     source: str = "unknown",
+419 ) -> int:
+420     if is_junk_email(email):
+421         return 0
+422     score = 20
+423     if source == "website":
+424         score += 40
+425     if email_matches_business(email, business_name, website):
+426         score += 40
+427     return min(score, 100)
+428 
+429 
+430 # ─────────────────────────────────────────────────────────
+431 # HTML extractors
+432 # ─────────────────────────────────────────────────────────
+433 
+434 def extract_emails_from_html(
+435     html: str,
+436     domain: str = None,
+437     business_name: str = None,
+438     source: str = "unknown",
+439     min_confidence: int = 40,
+440 ) -> list:
+441     if not html:
+442         return []
+443     pattern = (
+444         r'\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b'
+445     )
+446     raw_emails = re.findall(pattern, html)
+447     seen: set = set()
+448     unique_emails = []
+449     for e in raw_emails:
+450         e_lower = e.lower()
+451         if e_lower not in seen:
+452             seen.add(e_lower)
+453             unique_emails.append(e_lower)
+454     website = f"https://{domain}" if domain else None
+455     scored = []
+456     for email in unique_emails:
+457         if is_junk_email(email):
+458             continue
+459         confidence = score_email_confidence(
+460             email, business_name or "", website, source
+461         )
+462         if confidence >= min_confidence:
+463             scored.append((email, confidence))
+464     scored.sort(key=lambda x: x[1], reverse=True)
+465     return [email for email, _ in scored]
+466 
+467 
+468 def extract_phones_from_html(html: str) -> list:
+469     if not html:
+470         return []
+471 
+472     patterns = [
+473         r'0[12]\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4}',
+474         r'\(0\d{2,4}\)\s?\d{3,4}[\s\-]?\d{3,4}',
+475         r'07\d{3}[\s\-]?\d{6}',
+476         r'\+44[\s\-]?\d{2,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}',
+477         r'\+1[\s\-.]?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}',
+478         r'\+234[\s\-]?\d{3}[\s\-]?\d{3}[\s\-]?\d{4}',
+479         r'0[789]\d{9}',
+480         r'\+\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}',
+481     ]
+482 
+483     found = []
+484     seen_digits: set = set()
+485     for pattern in patterns:
+486         for phone in re.findall(pattern, html):
+487             digits = re.sub(r"\D", "", phone)
+488             if (
+489                 10 <= len(digits) <= 15
+490                 and digits not in seen_digits
+491             ):
+492                 seen_digits.add(digits)
+493                 found.append(phone.strip())
+494     return found
+495 
+496 
+497 def extract_phones_from_tel_links(soup: BeautifulSoup) -> list:
+498     phones = []
+499     seen_digits: set = set()
+500     for a in soup.find_all("a", href=True):
+501         href = a.get("href", "")
+502         if href.startswith("tel:"):
+503             phone = href.replace("tel:", "").strip()
+504             digits = re.sub(r"\D", "", phone)
+505             if 9 <= len(digits) <= 15 and digits not in seen_digits:
+506                 seen_digits.add(digits)
+507                 phones.append(phone)
+508     return phones
+509 
+510 
+511 def extract_emails_from_mailto_links(soup: BeautifulSoup) -> list:
+512     emails = []
+513     seen: set = set()
+514     for a in soup.find_all("a", href=True):
+515         href = a.get("href", "")
+516         if href.startswith("mailto:"):
+517             email = (
+518                 href.replace("mailto:", "")
+519                 .split("?")[0]
+520                 .strip()
+521                 .lower()
+522             )
+523             if "@" in email and email not in seen:
+524                 seen.add(email)
+525                 emails.append(email)
+526     return emails
+527 
+528 
+529 def extract_from_json_ld(soup: BeautifulSoup) -> dict:
+530     result = {"email": None, "phone": None, "address": None}
+531     for script in soup.find_all(
+532         "script", type="application/ld+json"
+533     ):
+534         try:
+535             raw = script.string or ""
+536             if not raw.strip():
+537                 continue
+538             data = json.loads(raw)
+539             items = data if isinstance(data, list) else [data]
+540             for item in items:
+541                 if not isinstance(item, dict):
+542                     continue
+543                 if not result["email"]:
+544                     email = item.get("email", "")
+545                     if email and "@" in email:
+546                         result["email"] = email.lower()
+547                 if not result["phone"]:
+548                     phone = (
+549                         item.get("telephone", "")
+550                         or item.get("phone", "")
+551                     )
+552                     if phone:
+553                         result["phone"] = str(phone).strip()
+554                 if not result["address"]:
+555                     addr = item.get("address", {})
+556                     if isinstance(addr, dict):
+557                         parts = [
+558                             addr.get("streetAddress", ""),
+559                             addr.get("addressLocality", ""),
+560                             addr.get("addressRegion", ""),
+561                             addr.get("postalCode", ""),
+562                         ]
+563                         address_str = ", ".join(
+564                             p for p in parts if p
+565                         )
+566                         if address_str:
+567                             result["address"] = address_str
+568         except Exception:
+569             continue
+570     return result
+571 
+572 
+573 def extract_social_links(html: str) -> dict:
+574     social = {
+575         "social_facebook_url":  None,
+576         "social_instagram_url": None,
+577         "social_linkedin_url":  None,
+578     }
+579     patterns = {
+580         "social_instagram_url": (
+581             r'https?://(?:www\.)?instagram\.com/'
+582             r'[A-Za-z0-9_.]+/?'
+583         ),
+584         "social_facebook_url": (
+585             r'https?://(?:www\.)?facebook\.com/'
+586             r'[A-Za-z0-9_.]+/?'
+587         ),
+588         "social_linkedin_url": (
+589             r'https?://(?:www\.)?linkedin\.com/'
+590             r'(?:company|in)/[A-Za-z0-9_\-]+/?'
+591         ),
+592     }
+593     for field, pattern in patterns.items():
+594         match = re.search(pattern, html, re.IGNORECASE)
+595         if match:
+596             social[field] = match.group(0)
+597     return social
+598 
+599 
+600 # ─────────────────────────────────────────────────────────
+601 # Decision maker extraction
+602 # ─────────────────────────────────────────────────────────
+603 
+604 _DM_TITLE_PATTERNS = re.compile(
+605     r'\b(?:Registered\s+Manager|Care\s+Home\s+Manager|'
+606     r'Nominated\s+Individual|Deputy\s+Manager|Unit\s+Manager|'
+607     r'Clinical\s+Lead|Matron|HR\s+Manager|Recruitment\s+Lead|'
+608     r'Director|Owner|Proprietor|Managing\s+Director|MD|CEO|'
+609     r'Founder|Head|CTO|CFO|COO|Co-Founder|Principal|President|'
+610     r'Chairman|Chairwoman|Executive\s+Director)\b',
+611     re.IGNORECASE,
+612 )
+613 
+614 _NAME_PATTERN = re.compile(
+615     r"\b([A-Z][a-zA-Z\'\-]{1,20}"
+616     r"(?:\s+[A-Z][a-zA-Z\'\-]{1,20}){1,2})\b"
+617 )
+618 _NAME_PATTERN_ALLCAPS = re.compile(
+619     r'\b([A-Z]{2,20}\s+[A-Z]{2,20})\b'
+620 )
+621 
+622 
+623 def _extract_decision_maker_from_html(
+624     html: str,
+625     soup: BeautifulSoup,
+626 ) -> str:
+627     if not html or not soup:
+628         return ""
+629 
+630     text = soup.get_text(separator=" ", strip=True)
+631     sentences = re.split(r'[.\n,;|]', text)
+632 
+633     for sentence in sentences:
+634         if _DM_TITLE_PATTERNS.search(sentence):
+635             names = _NAME_PATTERN.findall(sentence)
+636             for name in names:
+637                 combined = name.strip()
+638                 if _is_valid_name(combined):
+639                     # ── v9.9 FIX 7: return name only, no title embedded
+640                     # Was: f"{combined} — {title}" if title else combined
+641                     # Title is captured in dm_source field instead
+642                     return combined
+643 
+644             names_caps = _NAME_PATTERN_ALLCAPS.findall(sentence)
+645             for name in names_caps:
+646                 combined = name.strip()
+647                 if _is_valid_name(combined):
+648                     # ── v9.9 FIX 7: return name only
+649                     return combined
+650 
+651     meta_author = soup.find("meta", attrs={"name": "author"})
+652     if meta_author:
+653         content = meta_author.get("content", "").strip()
+654         if content and 3 < len(content) < 60:
+655             return content
+656 
+657     return ""
+658 
+659 
+660 def _is_valid_name(name: str) -> bool:
+661     if not name or len(name) < 4:
+662         return False
+663     lower = name.lower()
+664     invalid = {
+665         "team", "staff", "home", "care", "manager",
+666         "contact", "about", "services", "welcome",
+667         "phone", "email",
+668     }
+669     return lower not in invalid and not any(
+670         w in lower for w in invalid
+671     )
+672 
+673 
+674 def _extract_decision_maker_from_website(
+675     website_url: str,
+676     business_name: str,
+677 ) -> str:
+678     if not website_url:
+679         return ""
+680 
+681     if not website_url.startswith("http"):
+682         website_url = "https://" + website_url
+683 
+684     try:
+685         parsed = urlparse(website_url)
+686         base = f"{parsed.scheme}://{parsed.netloc}"
+687     except Exception:
+688         return ""
+689 
+690     paths = [
+691         "/about", "/about-us", "/team",
+692         "/our-team", "/management", "/staff",
+693     ]
+694 
+695     for path in paths:
+696         url = urljoin(base, path)
+697         try:
+698             html, soup = crawl_page(url)
+699             if not html or not soup:
+700                 continue
+701             name = _extract_decision_maker_from_html(html, soup)
+702             if name:
+703                 return name
+704         except Exception:
+705             continue
+706 
+707     return ""
+708 
+709 
+710 # ─────────────────────────────────────────────────────────
+711 # Social URL discovery via search
+712 # ─────────────────────────────────────────────────────────
+713 
+714 def _discover_social_urls_via_search(
+715     business_name: str,
+716     location: str = "",
+717 ) -> dict:
+718     social_results = {
+719         "social_facebook_url":  None,
+720         "social_instagram_url": None,
+721         "social_linkedin_url":  None,
+722     }
+723 
+724     platforms = [
+725         ("social_facebook_url",  "site:facebook.com"),
+726         ("social_instagram_url", "site:instagram.com"),
+727         ("social_linkedin_url",  "site:linkedin.com/company"),
+728     ]
+729 
+730     for field, site_op in platforms:
+731         try:
+732             query = (
+733                 f'{site_op} "{business_name}" {location}'.strip()
+734             )
+735 
+736             if _DDGS_AVAILABLE:
+737                 try:
+738                     with DDGS() as ddgs:
+739                         results = ddgs.text(query, max_results=5)
+740                         for r in results:
+741                             url = r.get("href", "")
+742                             platform_domain = (
+743                                 site_op
+744                                 .replace("site:", "")
+745                                 .split("/")[0]
+746                             )
+747                             if platform_domain in url:
+748                                 path = (
+749                                     urlparse(url)
+750                                     .path.strip("/")
+751                                 )
+752                                 if (
+753                                     path
+754                                     and len(path) > 2
+755                                     and "search" not in path
+756                                 ):
+757                                     social_results[field] = url
+758                                     break
+759                         if social_results[field]:
+760                             continue
+761                 except Exception:
+762                     pass
+763 
+764             url = (
+765                 "https://html.duckduckgo.com/html/?q="
+766                 + query.replace(" ", "+")
+767             )
+768             human_pause(0.5, 1.0)
+769             resp = requests.get(
+770                 url, headers=get_headers(), timeout=10
+771             )
+772             if resp.status_code != 200:
+773                 continue
+774 
+775             platform_domain = (
+776                 site_op.replace("site:", "").split("/")[0]
+777             )
+778             pattern = (
+779                 rf'https?://(?:www\.)?'
+780                 rf'{re.escape(platform_domain)}'
+781                 rf'/[A-Za-z0-9_./-]+'
+782             )
+783             matches = re.findall(pattern, resp.text, re.IGNORECASE)
+784 
+785             for match in matches:
+786                 path = urlparse(match).path.strip("/")
+787                 if (
+788                     path
+789                     and len(path) > 2
+790                     and "search" not in path
+791                 ):
+792                     social_results[field] = match
+793                     break
+794 
+795         except Exception as exc:
+796             logger.debug(
+797                 "_discover_social_urls_via_search error %s: %s",
+798                 field, exc,
+799             )
+800             continue
+801 
+802     return social_results
+803 
+804 
+805 # ─────────────────────────────────────────────────────────
+806 # Website crawler
+807 # ─────────────────────────────────────────────────────────
+808 
+809 def _get_parser() -> str:
+810     try:
+811         import lxml
+812         return "lxml"
+813     except ImportError:
+814         return "html.parser"
+815 
+816 
+817 def crawl_page(url: str, timeout: int = 10):
+818     try:
+819         resp = requests.get(
+820             url, headers=get_headers(),
+821             timeout=timeout, allow_redirects=True,
+822         )
+823         if resp.status_code < 400:
+824             parser = _get_parser()
+825             soup = BeautifulSoup(resp.text, parser)
+826             return resp.text, soup
+827     except Exception:
+828         pass
+829     return None, None
+830 
+831 
+832 def get_deep_contact_paths() -> list:
+833     return [
+834         "",
+835         "/contact",
+836         "/contact-us",
+837         "/about",
+838         "/about-us",
+839         "/team",
+840     ]
+841 
+842 
+843 def find_email_on_website(
+844     website_url: str,
+845     business_name: str = "",
+846 ) -> Optional[str]:
+847     if not website_url:
+848         return None
+849 
+850     if not website_url.startswith("http"):
+851         website_url = "https://" + website_url
+852 
+853     try:
+854         parsed = urlparse(website_url)
+855         base = f"{parsed.scheme}://{parsed.netloc}"
+856         domain = parsed.netloc.replace("www.", "")
+857         paths = get_deep_contact_paths()
+858         pages = [urljoin(base, path) for path in paths]
+859         if website_url not in pages:
+860             pages.insert(0, website_url)
+861 
+862         for page_url in pages:
+863             try:
+864                 human_pause(0.2, 0.5)
+865                 html, soup = crawl_page(page_url)
+866                 if not html or not soup:
+867                     continue
+868 
+869                 for email in extract_emails_from_mailto_links(soup):
+870                     if not is_junk_email(email):
+871                         logger.info("mailto found: %s", email)
+872                         return email
+873 
+874                 structured = extract_from_json_ld(soup)
+875                 if structured.get("email"):
+876                     email = structured["email"]
+877                     if not is_junk_email(email):
+878                         logger.info("JSON-LD email found: %s", email)
+879                         return email
+880 
+881                 emails = extract_emails_from_html(
+882                     html, domain=domain,
+883                     business_name=business_name,
+884                     source="website", min_confidence=40,
+885                 )
+886                 if emails:
+887                     logger.info("Text email found: %s", emails[0])
+888                     return emails[0]
+889 
+890             except Exception:
+891                 continue
+892 
+893     except Exception:
+894         pass
+895 
+896     return None
+897 
+898 
+899 def find_phone_on_website(website_url: str) -> Optional[str]:
+900     if not website_url:
+901         return None
+902     if not website_url.startswith("http"):
+903         website_url = "https://" + website_url
+904     try:
+905         parsed = urlparse(website_url)
+906         base = f"{parsed.scheme}://{parsed.netloc}"
+907         pages = [
+908             website_url,
+909             urljoin(base, "/contact"),
+910             urljoin(base, "/contact-us"),
+911         ]
+912         for page_url in pages:
+913             try:
+914                 human_pause(0.2, 0.5)
+915                 html, soup = crawl_page(page_url)
+916                 if not html or not soup:
+917                     continue
+918                 tel_phones = extract_phones_from_tel_links(soup)
+919                 if tel_phones:
+920                     return tel_phones[0]
+921                 structured = extract_from_json_ld(soup)
+922                 if structured.get("phone"):
+923                     return structured["phone"]
+924                 phones = extract_phones_from_html(html)
+925                 if phones:
+926                     return phones[0]
+927             except Exception:
+928                 continue
+929     except Exception:
+930         pass
+931     return None
+932 
+933 
+934 # ─────────────────────────────────────────────────────────
+935 # Website health
+936 # ─────────────────────────────────────────────────────────
+937 
+938 def check_website_health(url: str, timeout: int = 10) -> dict:
+939     result = {
+940         "active": False, "status_code": None,
+941         "redirect_url": None, "has_ssl": False,
+942         "load_time": None, "error": None,
+943     }
+944     if not url:
+945         return result
+946     if not url.startswith("http"):
+947         url = "https://" + url
+948     result["has_ssl"] = url.startswith("https")
+949     try:
+950         start = time.time()
+951         resp = requests.get(
+952             url, headers=get_headers(),
+953             timeout=timeout, allow_redirects=True,
+954         )
+955         elapsed = time.time() - start
+956         result["status_code"] = resp.status_code
+957         result["active"] = resp.status_code < 400
+958         result["load_time"] = round(elapsed, 2)
+959         if resp.url != url:
+960             result["redirect_url"] = resp.url
+961     except requests.exceptions.SSLError:
+962         try:
+963             http_url = url.replace("https://", "http://")
+964             resp = requests.get(
+965                 http_url, headers=get_headers(),
+966                 timeout=timeout, allow_redirects=True,
+967             )
+968             result["status_code"] = resp.status_code
+969             result["active"] = resp.status_code < 400
+970         except Exception as exc:
+971             result["error"] = str(exc)
+972     except Exception as exc:
+973         result["error"] = str(exc)
+974     return result
+975 
+976 
+977 # ─────────────────────────────────────────────────────────
+978 # Search engine email/phone finders
+979 # ─────────────────────────────────────────────────────────
+980 
+981 def search_email_duckduckgo(
+982     business_name: str,
+983     location: str = "",
+984     website: str = None,
+985 ) -> Optional[str]:
+986     if not business_name:
+987         return None
+988 
+989     if _DDGS_AVAILABLE:
+990         try:
+991             query = f'"{business_name}" {location} email'.strip()
+992             with DDGS() as ddgs:
+993                 results = ddgs.text(query, max_results=10)
+994                 for r in results:
+995                     html_snippet = r.get("body", "")
+996                     emails = extract_emails_from_html(
+997                         html_snippet,
+998                         business_name=business_name,
+999                         source="search", min_confidence=40,
+1000                     )
+1001                     for email in emails:
+1002                         if email_matches_business(
+1003                             email, business_name, website
+1004                         ):
+1005                             logger.info(
+1006                                 "DDGS email found: %s", email
+1007                             )
+1008                             return email
+1009         except Exception as exc:
+1010             logger.debug("DDGS email search failed: %s", exc)
+1011 
+1012     try:
+1013         query = f'"{business_name}" {location} email'.strip()
+1014         url = (
+1015             "https://html.duckduckgo.com/html/?q="
+1016             + query.replace(" ", "+")
+1017         )
+1018         human_pause(0.8, 1.5)
+1019         resp = requests.get(url, headers=get_headers(), timeout=15)
+1020         if resp.status_code == 200:
+1021             emails = extract_emails_from_html(
+1022                 resp.text,
+1023                 business_name=business_name,
+1024                 source="search", min_confidence=40,
+1025             )
+1026             for email in emails:
+1027                 if email_matches_business(
+1028                     email, business_name, website
+1029                 ):
+1030                     logger.info("DDG email found: %s", email)
+1031                     return email
+1032     except Exception as exc:
+1033         logger.debug("search_email_duckduckgo error: %s", exc)
+1034     return None
+1035 
+1036 
+1037 def search_email_bing(
+1038     business_name: str,
+1039     location: str = "",
+1040     website: str = None,
+1041 ) -> Optional[str]:
+1042     if not business_name:
+1043         return None
+1044     try:
+1045         query = (
+1046             f'"{business_name}" {location} email OR contact'.strip()
+1047         )
+1048         url = (
+1049             "https://www.bing.com/search?q="
+1050             + query.replace(" ", "+")
+1051         )
+1052         human_pause(0.8, 1.5)
+1053         resp = requests.get(url, headers=get_headers(), timeout=15)
+1054         if resp.status_code == 200:
+1055             emails = extract_emails_from_html(
+1056                 resp.text,
+1057                 business_name=business_name,
+1058                 source="search", min_confidence=40,
+1059             )
+1060             for email in emails:
+1061                 if email_matches_business(
+1062                     email, business_name, website
+1063                 ):
+1064                     logger.info("Bing email found: %s", email)
+1065                     return email
+1066     except Exception as exc:
+1067         logger.debug("search_email_bing error: %s", exc)
+1068     return None
+1069 
+1070 
+1071 def search_phone_duckduckgo(
+1072     business_name: str,
+1073     location: str = "",
+1074 ) -> Optional[str]:
+1075     if not business_name:
+1076         return None
+1077 
+1078     if _DDGS_AVAILABLE:
+1079         try:
+1080             query = (
+1081                 f'"{business_name}" {location} phone number'.strip()
+1082             )
+1083             with DDGS() as ddgs:
+1084                 results = ddgs.text(query, max_results=10)
+1085                 for r in results:
+1086                     html_snippet = r.get("body", "")
+1087                     phones = extract_phones_from_html(html_snippet)
+1088                     if phones:
+1089                         logger.info(
+1090                             "DDGS phone found: %s", phones[0]
+1091                         )
+1092                         return phones[0]
+1093         except Exception as exc:
+1094             logger.debug("DDGS phone search failed: %s", exc)
+1095 
+1096     try:
+1097         query = (
+1098             f'"{business_name}" {location} phone number'.strip()
+1099         )
+1100         url = (
+1101             "https://html.duckduckgo.com/html/?q="
+1102             + query.replace(" ", "+")
+1103         )
+1104         human_pause(0.8, 1.5)
+1105         resp = requests.get(url, headers=get_headers(), timeout=15)
+1106         if resp.status_code == 200:
+1107             phones = extract_phones_from_html(resp.text)
+1108             if phones:
+1109                 logger.info("DDG phone found: %s", phones[0])
+1110                 return phones[0]
+1111     except Exception as exc:
+1112         logger.debug("search_phone_duckduckgo error: %s", exc)
+1113     return None
+1114 
+1115 
+1116 # ─────────────────────────────────────────────────────────
+1117 # Multi-source finders (public API)
+1118 # ─────────────────────────────────────────────────────────
+1119 
+1120 def find_email_multi_source(
+1121     business_name: str,
+1122     website: str = None,
+1123     location: str = "",
+1124     progress_callback=None,
+1125 ) -> Optional[str]:
+1126     if website:
+1127         if progress_callback:
+1128             progress_callback("Checking website...")
+1129         email = find_email_on_website(website, business_name)
+1130         if email:
+1131             return email
+1132 
+1133     if progress_callback:
+1134         progress_callback("Searching DuckDuckGo...")
+1135     email = search_email_duckduckgo(business_name, location, website)
+1136     if email:
+1137         return email
+1138 
+1139     if progress_callback:
+1140         progress_callback("Searching Bing...")
+1141     email = search_email_bing(business_name, location, website)
+1142     if email:
+1143         return email
+1144 
+1145     return None
+1146 
+1147 
+1148 def find_phone_multi_source(
+1149     business_name: str,
+1150     website: str = None,
+1151     location: str = "",
+1152 ) -> Optional[str]:
+1153     if website:
+1154         phone = find_phone_on_website(website)
+1155         if phone:
+1156             return phone
+1157     phone = search_phone_duckduckgo(business_name, location)
+1158     if phone:
+1159         return phone
+1160     return None
+1161 
+1162 
+1163 # ─────────────────────────────────────────────────────────
+1164 # CQC Enrichment Hook — v9.9
+1165 # ─────────────────────────────────────────────────────────
+1166 
+1167 def _enrich_from_cqc(lead: dict) -> int:
+1168     """
+1169     Attempt to enrich lead from CQC API.
+1170 
+1171     ── v9.9 FIX 4: Runs ONLY when BOTH conditions are true:
+1172          country is a UK variant  AND  niche contains "care"
+1173        Previous version ran for any UK lead regardless of niche.
+1174        This wasted 2+ seconds per non-care-home UK lead.
+1175 
+1176     ── v9.9 FIX 5: Empty country string no longer triggers CQC.
+1177        Previous version had "" in the allowed country set.
+1178 
+1179     ── v9.9 FIX 6: Returns int (fields_added count) instead of
+1180        the lead dict. Previous version returned the lead dict and
+1181        the caller compared cqc_result != lead which was always
+1182        False because the dict was mutated in place — enrichment
+1183        was never counted and notes were never added.
+1184 
+1185     ── v9.9 FIX 1: cqc_location_id now written to lead.
+1186     ── v9.9 FIX 2: dm_source uses correct field name and value.
+1187     ── v9.9 FIX 3: decision_maker_confidence removed (not in schema).
+1188     ── v9.9 FIX 7: Name stored clean — title not appended to name.
+1189 
+1190     Mutates lead dict in place.
+1191     Returns number of fields added (0 if nothing improved).
+1192     """
+1193     if not _CQC_AVAILABLE:
+1194         return 0
+1195 
+1196     # ── v9.9 FIX 5: require an actual country value
+1197     country = str(lead.get("country") or "").strip().lower()
+1198     if not country:
+1199         return 0
+1200 
+1201     # ── v9.9 FIX 4: check BOTH country AND niche
+1202     _uk_variants = {
+1203         "uk", "united kingdom", "england",
+1204         "gb", "great britain", "wales",
+1205         "scotland", "northern ireland",
+1206     }
+1207     if country not in _uk_variants:
+1208         return 0
+1209 
+1210     niche = str(
+1211         lead.get("niche") or lead.get("industry") or ""
+1212     ).lower()
+1213     if "care" not in niche:
+1214         # Not a care home lead — skip CQC entirely
+1215         return 0
+1216 
+1217     business_name = lead.get("business_name", "")
+1218     city          = lead.get("city", "")
+1219     address       = lead.get("address", "")
+1220 
+1221     try:
+1222         result = lookup_cqc_location(business_name, city, address)
+1223     except Exception as exc:
+1224         logger.warning(
+1225             "CQC lookup exception for '%s': %s", business_name, exc
+1226         )
+1227         return 0
+1228 
+1229     if result.get("match_confidence") == "none":
+1230         return 0
+1231 
+1232     fields_added = 0
+1233 
+1234     # ── v9.9 FIX 7: store name cleanly — no title appended
+1235     # ── v9.9 FIX 2: dm_source uses "cqc" not "cqc_api"
+1236     if (
+1237         result.get("registered_manager")
+1238         and not lead.get("decision_maker_name", "").strip()
+1239     ):
+1240         lead["decision_maker_name"] = result["registered_manager"]
+1241         lead["dm_source"]           = "cqc"   # correct field + value
+1242         # decision_maker_confidence removed — not in schema (FIX 3)
+1243         fields_added += 1
+1244         logger.info(
+1245             "CQC DM found: %s", result["registered_manager"]
+1246         )
+1247 
+1248     if result.get("phone") and not lead.get("phone", "").strip():
+1249         lead["phone"]            = result["phone"]
+1250         lead["phone_confidence"] = 90
+1251         lead["phone_source"]     = "cqc_api"
+1252         fields_added += 1
+1253 
+1254     if (
+1255         result.get("address")
+1256         and not lead.get("address", "").strip()
+1257     ):
+1258         lead["address"] = result["address"]
+1259         fields_added += 1
+1260 
+1261     if result.get("cqc_rating"):
+1262         lead["cqc_rating"] = result["cqc_rating"]
+1263         fields_added += 1
+1264 
+1265     if result.get("cqc_url"):
+1266         lead["cqc_url"] = result["cqc_url"]
+1267         fields_added += 1
+1268 
+1269     # ── v9.9 FIX 1: cqc_location_id now written to lead
+1270     # Previous version never wrote this field at all
+1271     if result.get("cqc_location_id"):
+1272         lead["cqc_location_id"] = result["cqc_location_id"]
+1273         fields_added += 1
+1274 
+1275     if fields_added > 0:
+1276         existing_notes = lead.get("enrichment_notes", "")
+1277         lead["enrichment_notes"] = (
+1278             (existing_notes + " | CQC data enriched").strip(" |")
+1279             if existing_notes
+1280             else "CQC data enriched"
+1281         )
+1282 
+1283     return fields_added
+1284 
+1285 
+1286 # ─────────────────────────────────────────────────────────
+1287 # Full lead enrichment — v9.9
+1288 # ─────────────────────────────────────────────────────────
+1289 
+1290 def enrich_lead(
+1291     lead: dict,
+1292     find_email: bool = True,
+1293     find_phone: bool = True,
+1294 ) -> dict:
+1295     """
+1296     Full lead enrichment pipeline.
+1297 
+1298     Steps:
+1299       0. CQC lookup (UK care homes only)
+1300       1. Website discovery (if missing)
+1301       2. Website health check
+1302       3. Social links from website HTML
+1303       4. Decision maker extraction (web fallback if CQC missed)
+1304       5. Social URL discovery via search
+1305       6. Phone discovery
+1306       7. Email discovery
+1307       8. Status update
+1308 
+1309     v9.9 changes:
+1310       FIX 1:  cqc_location_id written to lead
+1311       FIX 2:  dm_source correct field name + value
+1312       FIX 3:  decision_maker_confidence removed
+1313       FIX 4:  CQC only runs for care home niche
+1314       FIX 5:  Empty country no longer triggers CQC
+1315       FIX 6:  _enrich_from_cqc returns count — fixes false comparison
+1316       FIX 7:  DM name stored clean (no title appended)
+1317       FIX 8:  dm_source set to "website" when name found from website
+1318     """
+1319     if not lead:
+1320         return lead
+1321 
+1322     lead = dict(lead)   # don't mutate caller's dict
+1323 
+1324     business_name = lead.get("business_name", "")
+1325     website       = (lead.get("website") or "").strip()
+1326     city          = lead.get("city") or lead.get("location") or ""
+1327     country       = lead.get("country") or ""
+1328     location      = ", ".join(p for p in [city, country] if p)
+1329 
+1330     enrichment_notes: list = []
+1331     fields_improved = 0
+1332 
+1333     # ── Step 0: CQC Lookup (UK care homes only) ────────────
+1334     # ── v9.9 FIX 6: _enrich_from_cqc now returns int count
+1335     # Previous: cqc_result != lead was always False (same object)
+1336     # Now: direct count makes intent explicit
+1337     cqc_fields = _enrich_from_cqc(lead)
+1338     if cqc_fields > 0:
+1339         fields_improved += cqc_fields
+1340         enrichment_notes.append("CQC data enriched")
+1341 
+1342     # ── Step 1: Website discovery ──────────────────────────
+1343     if not website or website.lower() in ("", "none", "null"):
+1344         logger.info(
+1345             "No website for '%s' — searching...", business_name
+1346         )
+1347 
+1348         discovered_url, discovered_from = discover_business_website(
+1349             business_name, location
+1350         )
+1351 
+1352         if discovered_url:
+1353             if not lead.get("website"):
+1354                 lead["website"] = discovered_url
+1355                 website = discovered_url
+1356 
+1357             lead["website_discovered"]           = 1
+1358             lead["website_discovery_source"]     = discovered_from
+1359             lead["website_discovery_confidence"] = (
+1360                 "high"
+1361                 if discovered_from == "duckduckgo"
+1362                 else "medium"
+1363             )
+1364             fields_improved += 1
+1365             enrichment_notes.append(
+1366                 f"Website found via {discovered_from}"
+1367             )
+1368             logger.info(
+1369                 "Website discovered: %s (%s)",
+1370                 discovered_url, discovered_from,
+1371             )
+1372 
+1373         else:
+1374             lead["website_discovered"]           = 0
+1375             lead["website_discovery_source"]     = "not_found"
+1376             lead["website_discovery_confidence"] = "low"
+1377             enrichment_notes.append("Website not found")
+1378 
+1379     else:
+1380         if not lead.get("website_discovered"):
+1381             lead["website_discovered"] = 0
+1382 
+1383     if website and not website.startswith("http"):
+1384         website       = "https://" + website
+1385         lead["website"] = website
+1386 
+1387     # ── Step 2: Website health + contacts ─────────────────
+1388     if website:
+1389         health = check_website_health(website)
+1390 
+1391         if health.get("active"):
+1392             html, soup = None, None
+1393             try:
+1394                 html, soup = crawl_page(website)
+1395             except Exception as exc:
+1396                 enrichment_notes.append(
+1397                     f"Crawl error: {str(exc)[:50]}"
+1398                 )
+1399 
+1400             if html and soup:
+1401 
+1402                 # Step 3: Social links from website HTML
+1403                 social_from_html = extract_social_links(html)
+1404                 for field, url_val in social_from_html.items():
+1405                     if url_val and not lead.get(field):
+1406                         lead[field] = url_val
+1407                         fields_improved += 1
+1408                         enrichment_notes.append(
+1409                             f"{field} from website"
+1410                         )
+1411 
+1412                 # Step 4: Decision maker — web fallback
+1413                 # Only runs if CQC did not already find a name
+1414                 # ── v9.9 FIX 8: dm_source set to "website"
+1415                 if not lead.get("decision_maker_name", "").strip():
+1416                     dm_name = _extract_decision_maker_from_html(
+1417                         html, soup
+1418                     )
+1419                     if not dm_name:
+1420                         dm_name = (
+1421                             _extract_decision_maker_from_website(
+1422                                 website, business_name
+1423                             )
+1424                         )
+1425                     if dm_name:
+1426                         lead["decision_maker_name"] = dm_name
+1427                         lead["dm_source"]           = "website"
+1428                         fields_improved += 1
+1429                         enrichment_notes.append(
+1430                             f"Decision maker: {dm_name}"
+1431                         )
+1432                         logger.info("DM found: %s", dm_name)
+1433 
+1434                 # Phone — only if missing
+1435                 if find_phone and not lead.get("phone"):
+1436                     tel_phones = extract_phones_from_tel_links(soup)
+1437                     if tel_phones:
+1438                         lead["phone"]            = tel_phones[0]
+1439                         lead["phone_confidence"] = 90
+1440                         fields_improved += 1
+1441                         enrichment_notes.append("Phone via tel: link")
+1442                     else:
+1443                         structured = extract_from_json_ld(soup)
+1444                         if structured.get("phone"):
+1445                             lead["phone"]            = (
+1446                                 structured["phone"]
+1447                             )
+1448                             lead["phone_confidence"] = 85
+1449                             fields_improved += 1
+1450                             enrichment_notes.append(
+1451                                 "Phone via JSON-LD"
+1452                             )
+1453                         else:
+1454                             phones = extract_phones_from_html(html)
+1455                             if phones:
+1456                                 lead["phone"]            = phones[0]
+1457                                 lead["phone_confidence"] = 60
+1458                                 fields_improved += 1
+1459                                 enrichment_notes.append(
+1460                                     "Phone via website text"
+1461                                 )
+1462 
+1463                 # Email — only if missing
+1464                 if find_email and not lead.get("email"):
+1465                     for email in extract_emails_from_mailto_links(
+1466                         soup
+1467                     ):
+1468                         if not is_junk_email(email):
+1469                             lead["email"]            = email
+1470                             lead["email_confidence"] = 95
+1471                             fields_improved += 1
+1472                             enrichment_notes.append(
+1473                                 "Email via mailto"
+1474                             )
+1475                             break
+1476 
+1477                     if not lead.get("email"):
+1478                         structured = extract_from_json_ld(soup)
+1479                         if structured.get("email") and not (
+1480                             is_junk_email(structured["email"])
+1481                         ):
+1482                             lead["email"]            = (
+1483                                 structured["email"]
+1484                             )
+1485                             lead["email_confidence"] = 90
+1486                             fields_improved += 1
+1487                             enrichment_notes.append(
+1488                                 "Email via JSON-LD"
+1489                             )
+1490 
+1491                     if not lead.get("email"):
+1492                         domain = urlparse(website).netloc.replace(
+1493                             "www.", ""
+1494                         )
+1495                         emails = extract_emails_from_html(
+1496                             html, domain=domain,
+1497                             business_name=business_name,
+1498                             source="website", min_confidence=40,
+1499                         )
+1500                         if emails:
+1501                             lead["email"]            = emails[0]
+1502                             lead["email_confidence"] = 75
+1503                             fields_improved += 1
+1504                             enrichment_notes.append(
+1505                                 "Email via website text"
+1506                             )
+1507 
+1508         else:
+1509             enrichment_notes.append(
+1510                 f"Website inactive "
+1511                 f"({health.get('status_code', 'unknown')})"
+1512             )
+1513 
+1514     # ── Step 5: Social URL search discovery ───────────────
+1515     has_all_social = (
+1516         lead.get("social_facebook_url")
+1517         and lead.get("social_instagram_url")
+1518         and lead.get("social_linkedin_url")
+1519     )
+1520     if not has_all_social and business_name:
+1521         social_from_search = _discover_social_urls_via_search(
+1522             business_name, location
+1523         )
+1524         for field, url_val in social_from_search.items():
+1525             if url_val and not lead.get(field):
+1526                 lead[field] = url_val
+1527                 fields_improved += 1
+1528                 enrichment_notes.append(f"{field} via search")
+1529 
+1530     # ── Step 6: Phone from search if still missing ────────
+1531     if find_phone and not lead.get("phone"):
+1532         phone = search_phone_duckduckgo(business_name, location)
+1533         if phone:
+1534             lead["phone"]            = phone
+1535             lead["phone_confidence"] = 50
+1536             fields_improved += 1
+1537             enrichment_notes.append("Phone via DDG search")
+1538 
+1539     # ── Step 7: Email from search if still missing ────────
+1540     if find_email and not lead.get("email"):
+1541         email = find_email_multi_source(
+1542             business_name=business_name,
+1543             website=website or None,
+1544             location=location,
+1545         )
+1546         if email:
+1547             lead["email"] = email
+1548             lead["email_confidence"] = (
+1549                 lead.get("email_confidence") or 50
+1550             )
+1551             fields_improved += 1
+1552             enrichment_notes.append("Email via web search")
+1553 
+1554     # ── Step 8: Status + meta ─────────────────────────────
+1555     lead["enrichment_status"] = (
+1556         "done" if fields_improved > 0 else "attempted"
+1557     )
+1558     lead["last_enriched_at"] = (
+1559         datetime.now(timezone.utc).isoformat()
+1560     )
+1561     if enrichment_notes:
+1562         lead["enrichment_notes"] = " | ".join(enrichment_notes)
+1563 
+1564     logger.info(
+1565         "Enrichment complete for '%s': %d fields improved",
+1566         business_name, fields_improved,
+1567     )
+1568     return lead
+1569 
+1570 
+1571 # ─────────────────────────────────────────────────────────
+1572 # Re-enrichment engine — v9.9
+1573 # ─────────────────────────────────────────────────────────
+1574 
+1575 def reenrich_leads_missing_emails(
+1576     limit: int = 50,
+1577     progress_callback=None,
+1578 ) -> dict:
+1579     """
+1580     Re-enrich all leads in DB missing emails.
+1581     v9.9: UPDATE SQL now includes all 4 new columns:
+1582           cqc_rating, cqc_url, cqc_location_id, dm_source
+1583     Previous version never wrote these to the DB on re-enrich.
+1584     """
+1585     import sqlite3
+1586 
+1587     try:
+1588         from database import (
+1589             get_leads_missing_emails,
+1590             update_lead_email,
+1591             get_connection,
+1592         )
+1593     except ImportError as exc:
+1594         logger.error("database import failed: %s", exc)
+1595         return {
+1596             "processed": 0, "emails_found": 0,
+1597             "websites_found": 0, "phones_found": 0,
+1598         }
+1599 
+1600     leads = get_leads_missing_emails(limit=limit)
+1601 
+1602     results = {
+1603         "processed": 0, "emails_found": 0,
+1604         "websites_found": 0, "phones_found": 0,
+1605     }
+1606 
+1607     total = len(leads)
+1608     logger.info("Re-enriching %d leads missing emails", total)
+1609 
+1610     conn = None
+1611     try:
+1612         conn = get_connection()
+1613         conn.row_factory = sqlite3.Row
+1614 
+1615         for i, lead in enumerate(leads):
+1616             name = lead.get("business_name", "...")
+1617 
+1618             if progress_callback:
+1619                 progress_callback(i, total, name)
+1620 
+1621             logger.info("[%d/%d] %s", i + 1, total, name)
+1622 
+1623             had_website = bool(lead.get("website"))
+1624 
+1625             enriched = enrich_lead(
+1626                 lead, find_email=True, find_phone=True
+1627             )
+1628 
+1629             results["processed"] += 1
+1630 
+1631             if enriched.get("email"):
+1632                 results["emails_found"] += 1
+1633                 try:
+1634                     update_lead_email(
+1635                         enriched["id"], enriched["email"]
+1636                     )
+1637                 except Exception as exc:
+1638                     logger.warning(
+1639                         "update_lead_email error: %s", exc
+1640                     )
+1641 
+1642             if not had_website and enriched.get("website"):
+1643                 results["websites_found"] += 1
+1644 
+1645             if enriched.get("phone"):
+1646                 results["phones_found"] += 1
+1647 
+1648             # ── v9.9: UPDATE includes all 4 new columns ───────────
+1649             # Previous version was missing:
+1650             #   cqc_rating, cqc_url, cqc_location_id, dm_source
+1651             # Those 4 fields were enriched into the dict but
+1652             # never written back to the database.
+1653             try:
+1654                 conn.execute(
+1655                     """
+1656                     UPDATE leads
+1657                     SET
+1658                         website = COALESCE(NULLIF(website, ''), ?),
+1659                         phone   = COALESCE(NULLIF(phone, ''), ?),
+1660                         enrichment_status            = ?,
+1661                         last_enriched_at             = ?,
+1662                         email_confidence             = ?,
+1663                         phone_confidence             = ?,
+1664                         website_discovered           = ?,
+1665                         website_discovery_source     = COALESCE(
+1666                             NULLIF(website_discovery_source, ''), ?
+1667                         ),
+1668                         website_discovery_confidence = COALESCE(
+1669                             NULLIF(website_discovery_confidence, ''),
+1670                             ?
+1671                         ),
+1672                         decision_maker_name = COALESCE(
+1673                             NULLIF(decision_maker_name, ''), ?
+1674                         ),
+1675                         dm_source           = COALESCE(
+1676                             NULLIF(dm_source, ''), ?
+1677                         ),
+1678                         social_facebook_url  = COALESCE(
+1679                             NULLIF(social_facebook_url, ''), ?
+1680                         ),
+1681                         social_instagram_url = COALESCE(
+1682                             NULLIF(social_instagram_url, ''), ?
+1683                         ),
+1684                         social_linkedin_url  = COALESCE(
+1685                             NULLIF(social_linkedin_url, ''), ?
+1686                         ),
+1687                         cqc_rating       = COALESCE(
+1688                             NULLIF(cqc_rating, ''), ?
+1689                         ),
+1690                         cqc_url          = COALESCE(
+1691                             NULLIF(cqc_url, ''), ?
+1692                         ),
+1693                         cqc_location_id  = COALESCE(
+1694                             NULLIF(cqc_location_id, ''), ?
+1695                         ),
+1696                         enrichment_notes = ?,
+1697                         updated_at       = datetime('now')
+1698                     WHERE id = ?
+1699                     """,
+1700                     (
+1701                         enriched.get("website")              or "",
+1702                         enriched.get("phone")                or "",
+1703                         enriched.get(
+1704                             "enrichment_status", "attempted"
+1705                         ),
+1706                         enriched.get("last_enriched_at"),
+1707                         enriched.get("email_confidence",     0),
+1708                         enriched.get("phone_confidence",     0),
+1709                         enriched.get("website_discovered",   0),
+1710                         enriched.get(
+1711                             "website_discovery_source",      ""
+1712                         ),
+1713                         enriched.get(
+1714                             "website_discovery_confidence",  ""
+1715                         ),
+1716                         enriched.get("decision_maker_name",  ""),
+1717                         # ── v9.9: dm_source now included
+1718                         enriched.get("dm_source",            ""),
+1719                         enriched.get("social_facebook_url",  ""),
+1720                         enriched.get("social_instagram_url", ""),
+1721                         enriched.get("social_linkedin_url",  ""),
+1722                         # ── v9.9: 3 new CQC columns now included
+1723                         enriched.get("cqc_rating",           ""),
+1724                         enriched.get("cqc_url",              ""),
+1725                         enriched.get("cqc_location_id",      ""),
+1726                         enriched.get("enrichment_notes",     ""),
+1727                         enriched["id"],
+1728                     ),
+1729                 )
+1730                 conn.commit()
+1731 
+1732             except Exception as exc:
+1733                 logger.warning(
+1734                     "DB update error for lead %s: %s",
+1735                     enriched.get("id"), exc,
+1736                 )
+1737                 try:
+1738                     conn.rollback()
+1739                 except Exception:
+1740                     pass
+1741 
+1742             human_pause(0.3, 0.8)
+1743 
+1744     except Exception as exc:
+1745         logger.error("Re-enrichment batch error: %s", exc)
+1746 
+1747     finally:
+1748         if conn:
+1749             try:
+1750                 conn.close()
+1751             except Exception:
+1752                 pass
+1753 
+1754     logger.info(
+1755         "Re-enrichment complete: "
+1756         "processed=%d emails=%d websites=%d phones=%d",
+1757         results["processed"], results["emails_found"],
+1758         results["websites_found"], results["phones_found"],
+1759     )
+1760     return results
+1761 
+1762 
+1763 # ─────────────────────────────────────────────────────────
+1764 # Contact completeness helper
+1765 # ─────────────────────────────────────────────────────────
+1766 
+1767 def get_contact_completeness(lead: dict) -> dict:
+1768     """
+1769     Return contact completeness as dict.
+1770     Canonical definition — scorer.py should import from here.
+1771     """
+1772     score = 0
+1773     if lead.get("phone"):
+1774         score += 40
+1775     if lead.get("email"):
+1776         score += 35
+1777     if lead.get("website"):
+1778         score += 15
+1779     if lead.get("address"):
+1780         score += 10
+1781     pct = min(score, 100)
+1782     return {
+1783         "percentage":  pct,
+1784         "score":       pct,
+1785         "has_phone":   bool(lead.get("phone")),
+1786         "has_email":   bool(lead.get("email")),
+1787         "has_website": bool(lead.get("website")),
+1788         "has_address": bool(lead.get("address")),
+1789     }

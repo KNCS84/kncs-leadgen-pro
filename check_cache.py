@@ -1,0 +1,13 @@
+import json 
+out = open('cache_check.txt', 'w', encoding='utf-8') 
+data = json.load(open('engine/cqc_location_cache.json', encoding='utf-8')) 
+out.write('TOP LEVEL KEYS:\n') 
+for k in data.keys(): out.write('  ' + k + '\n') 
+locs = data.get('locations', []) 
+out.write('LOCATIONS COUNT: ' + str(len(locs)) + '\n') 
+care = data.get('care_homes', []) 
+out.write('CARE_HOMES COUNT: ' + str(len(care)) + '\n') 
+out.write('TOTAL_CARE_HOMES KEY: ' + str(data.get('total_care_homes', 'MISSING')) + '\n') 
+if locs: out.write('FIRST LOC KEYS: ' + str(list(locs[0].keys())) + '\n') 
+out.close() 
+print('DONE') 

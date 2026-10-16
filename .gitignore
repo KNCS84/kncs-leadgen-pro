@@ -1,0 +1,34 @@
+# Virtual environment — never commit this
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables — never commit
+.env
+
+# Data and cache
+data/debug/
+cqc_location_cache.json
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
