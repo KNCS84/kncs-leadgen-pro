@@ -644,9 +644,16 @@ def _wa_gate(lead: dict) -> dict:
         "show_composer": verified or estimated,
         "verified":      verified,
         "estimated":     estimated,
-        "wa_link":       build_wa_prefill_link(
-            phone_clean, "Hi, is this the business WhatsApp?"
-        ),
+        # WA_CHECK_FIX_R4: a presence check must not draft a message.
+        # This used to call build_wa_prefill_link(phone_clean, "Hi, is this the
+        # business WhatsApp?"), which produces
+        #     https://wa.me/<number>?text=Hi%2C%20is%20this...
+        # wa.me answers 302 to api.whatsapp.com/send/?phone=..&text=.. - so the
+        # "Check" button opened the chat with a cold message pre-written, one
+        # Enter away from being sent to a stranger from the owner's own
+        # WhatsApp. No text parameter means no draft. Opening a chat is a
+        # check; pre-writing a message is outreach.
+        "wa_link":       ("https://wa.me/" + phone_clean) if phone_clean else "",
         "phone_clean":   phone_clean,
         "display_phone": phone,
         "reason": (
@@ -1653,6 +1660,13 @@ def render_whatsapp_manual_tools(
 ) -> None:
     if not wa_gate.get("phone_clean"): return
     _section("WA Verification", "Confirm before sending.")
+    # WA_CHECK_FIX_R4: say what this button does, and what it cannot prove.
+    st.caption(
+        "This opens the chat only. No message is written and nothing is sent. "
+        "A number that has never written to you shows no display name and no "
+        "profile photo - that is the whole of what a presence check can tell "
+        "you. It is not an opt-in."
+    )
     c1, c2 = st.columns(2)
     with c1:
         wa_link = wa_gate.get("wa_link", "")
@@ -1686,12 +1700,39 @@ def render_whatsapp_composer(lead: dict, wa_gate: dict) -> None:
 
     # BUG-028: sender_name from session state - never lead's business name
     sender_name = _get_sender_name()
-    generated = build_whatsapp_message(
-        lead, tone=tone,
-        sender_name=sender_name,
-        company_name=COMPANY_NAME,
-        cta_link=CTA_LINK,
+
+    # WA_MSG_FIX_R3: the demo comes first, and the text may only describe
+    # things that were measured. See build_demo_first_message() below.
+    _demo_url = " ".join(str(
+        lead.get("demo_url")
+        or lead.get("demo_link")
+        or st.session_state.get("demo_url_" + str(lead_id))
+        or ""
+    ).split())
+
+    _built = build_demo_first_message(
+        lead, sender_name=sender_name, company_name=COMPANY_NAME,
+        demo_url=_demo_url, channel="whatsapp",
     )
+    if _built["refused"]:
+        st.error("Composer refused: " + _built["refused"].replace("_", " ")
+                 + ". Nothing was written rather than guess.")
+        generated = ""
+    else:
+        generated = _r3_guard(_built["message"], lead)
+        if not generated:
+            st.error("Composer refused: the draft contained a claim with no "
+                     "measurement behind it. Nothing was written.")
+        elif _built["source"] == "generic":
+            st.warning("No measurement for this lead yet - the message makes no "
+                       "claim about their website. Add facts to raise the quality.")
+
+    if _demo_url:
+        st.caption("Demo in message: " + _demo_url)
+    else:
+        st.caption("No demo URL set for this lead - the message offers one without "
+                   "naming it. Paste a demo link in Demo URL above to lead with it.")
+
     final_msg = st.text_area(
         "Message (edit if needed)",
         value=generated, height=200,
@@ -1721,6 +1762,152 @@ def render_whatsapp_composer(lead: dict, wa_gate: dict) -> None:
         )
     else:
         st.warning("No valid phone to open WhatsApp.")
+
+
+# ---------------------------------------------------------
+# WA_MSG_FIX_R3: the composer may only say what was measured
+#
+# The old composer called build_whatsapp_message(), which prints
+# "(website audit: 8/10 - Average)" on every lead. That number comes from
+# engine/scorer.py compute_website_audit_score(), which reads rating, reviews,
+# phone and a discovery flag - it never fetches the page. Nothing was audited.
+# It also had no concept of a demo, so the message could not lead with one.
+#
+# This writer takes measured facts and a demo URL. With no facts it refuses.
+# A refusal is the correct output; an invented sentence is not.
+# ---------------------------------------------------------
+
+def _r3_norm(text) -> str:
+    return " ".join(str(text or "").split()).strip().lower()
+
+
+def _r3_first_words(text, limit: int = 4) -> str:
+    """Google Maps names carry keyword stuffing. Cut at the first separator."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return ""
+    for sep in ("||", "|", " - ", " :: "):
+        if sep in raw:
+            raw = raw.split(sep)[0]
+    words = raw.split()
+    return " ".join(words[:limit]).strip(" .,-")
+
+
+def _r3_facts_from_lead(lead: dict) -> dict:
+    """Measured facts only. website_audit_score is deliberately NOT read."""
+    f = lead.get("evidence")
+    if isinstance(f, dict) and f:
+        return f
+    if isinstance(f, str) and f.strip().startswith("{"):
+        try:
+            got = json.loads(f)
+            if isinstance(got, dict) and got:
+                return got
+        except Exception:
+            pass
+    return {}
+
+
+def build_demo_first_message(lead: dict, sender_name: str, company_name: str,
+                             demo_url: str = "", channel: str = "whatsapp") -> dict:
+    """Return {'message', 'source', 'refused', 'claims'}.
+
+    source is 'measured' or 'generic'. When neither is possible we refuse and
+    print nothing rather than invent a sentence.
+    """
+    name = _r3_first_words(lead.get("business_name") or lead.get("business") or "", 4)
+    city = " ".join(str(lead.get("city") or "").split())
+    country = " ".join(str(lead.get("country") or "").split())
+    demo_url = " ".join(str(demo_url or "").split())
+    sender_name = " ".join(str(sender_name or "").split()) or "the team"
+
+    if not name:
+        return {"message": "", "source": "", "refused": "no_business_name",
+                "claims": []}
+
+    facts = _r3_facts_from_lead(lead)
+    has_site = facts.get("has_site")
+    load_ms = facts.get("load_ms")
+    http_status = facts.get("http_status")
+    https_ok = facts.get("https_ok")
+    mobile = facts.get("mobile_friendly")
+    has_form = facts.get("has_form")
+
+    lines = []
+    claims = []
+
+    # ---- line 1: what was actually observed
+    if has_site is False:
+        lines.append(
+            "Hi %s - I looked you up%s and found your listing but no website."
+            % (name, (" in " + city) if city else "")
+        )
+        claims.append("no site: taken from a real fetch that failed")
+    elif has_site is True:
+        marks = []
+        if isinstance(load_ms, (int, float)) and load_ms:
+            marks.append("it took %.1fs to load" % (float(load_ms) / 1000.0))
+            claims.append("load time: measured")
+        if http_status:
+            marks.append("it answered %s" % int(http_status))
+            claims.append("http status: measured")
+        if mobile is False:
+            marks.append("it does not fit a phone screen")
+            claims.append("mobile: measured")
+        if https_ok is False:
+            marks.append("it is not on https")
+            claims.append("https: measured")
+        if has_form is False:
+            marks.append("there is no way to get in touch on the page")
+            claims.append("contact form: measured")
+        tail = (" - " + ", ".join(marks[:3])) if marks else ""
+        lines.append(
+            "Hi %s - I had a look at your website%s%s."
+            % (name, (" in " + city) if city else "", tail)
+        )
+    else:
+        # Nothing was measured. Say nothing about their site.
+        lines.append("Hi %s - I came across your business%s."
+                     % (name, (" in " + city) if city else ""))
+        claims.append("no site claims made")
+
+    # ---- line 2: the demo, which is the reason for the message
+    if demo_url:
+        lines.append("I built you a working demo to look at: " + demo_url)
+        claims.append("demo image: was generated and uploaded")
+    else:
+        lines.append(
+            "I build sites for %s businesses and I would rather show you than "
+            "describe it." % (country or "local")
+        )
+
+    # ---- line 3: the single question
+    if channel == "whatsapp":
+        q = "Want me to send you a 60-second screen recording of it, or would a short Google Meet suit you better?"
+    else:
+        q = "Would a 60-second screen recording be useful, or would you rather a short call?"
+    lines.append(q)
+
+    lines.append("- %s (%s)" % (sender_name, company_name))
+
+    message = "\n\n".join(lines)
+    return {"message": message.strip(), "source": "measured" if facts else "generic",
+            "refused": "", "claims": claims}
+
+
+def _r3_guard(text: str, lead: dict) -> str:
+    """Last gate before the box is filled. Strip anything unmeasured."""
+    out = str(text or "")
+    facts = _r3_facts_from_lead(lead)
+    banned = ("website audit", "audit score", "/10", "trust signals",
+              "web presence", "i reviewed", "i conducted", "seo score")
+    if any(b in out.lower() for b in banned):
+        return ""
+    if not facts:
+        for b in ("your website", "no website", "your site"):
+            if b in out.lower():
+                return ""
+    return out
 
 
 # ---------------------------------------------------------
