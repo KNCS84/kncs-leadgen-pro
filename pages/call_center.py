@@ -1,13 +1,13 @@
 # pages/call_center.py
-# KNCS LeadGen Pro — v10.1
+# KNCS LeadGen Pro â€” v10.1
 #
 # Audit fixes applied:
 #   BUG-027: log_call_outcome() dedup via session_state["_logged_outcomes"]
 #            set; (bool, str) return from log_outreach_action() handled
 #   BUG-028: _get_sender_name() checks session_state first; business name
 #            never used as greeting recipient
-#   BUG-029: get_call_queue() sort: market → wa_status → -fit_score →
-#            -urgency_score → priority_rank
+#   BUG-029: get_call_queue() sort: market â†’ wa_status â†’ -fit_score â†’
+#            -urgency_score â†’ priority_rank
 #   ISSUE-A: log_call_outcome() revenue write uses save_revenue_record()
 #            (enforces UNIQUE(lead_id, service_type) via database.py)
 #   ISSUE-B: get_live_stats() high_fit threshold corrected to >= 70 (0-100)
@@ -28,16 +28,16 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Sender constants
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 SENDER_NAME  = "Amechi"
 COMPANY_NAME = "King Networks Consulting Services (KNCS)"
 CTA_LINK     = ""
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Design tokens
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _BG_BASE    = "#060d19"
 _BG_SURFACE = "#0b1628"
 _BG_RAISED  = "#101f38"
@@ -58,9 +58,9 @@ _BORDER_BRD = "rgba(91,140,255,0.28)"
 _GLOW_BLUE  = "rgba(91,140,255,0.18)"
 _GLOW_WA    = "rgba(37,211,102,0.15)"
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Safe DB imports
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
     from database import (
         get_connection,
@@ -105,9 +105,9 @@ except Exception:
     def batch_verify_whatsapp(lids, verified=True) -> int: return 0
     def save_revenue_record(*a, **k) -> bool:                 return False
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Safe scorer imports
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
     from engine.scorer import (
         get_fit_label,
@@ -161,9 +161,9 @@ except Exception:
     def score_and_save_lead(lead_id) -> Optional[dict]:
         return None
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Safe WhatsApp imports
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
     from engine.whatsapp_messages import (
         build_whatsapp_message,
@@ -176,7 +176,7 @@ except Exception:
         company_name=COMPANY_NAME,
         cta_link="",
     ) -> str:
-        # ISSUE-F: BUG-028 — use decision_maker_name not business_name
+        # ISSUE-F: BUG-028 â€” use decision_maker_name not business_name
         # as the greeting recipient in the fallback too
         dm_name  = (
             lead.get("decision_maker_name")
@@ -186,7 +186,7 @@ except Exception:
         greeting = dm_name.strip() if dm_name.strip() else "there"
         return (
             f"Hi {greeting}, I noticed your business could benefit "
-            f"from a professional website.\n\n— {sender_name}"
+            f"from a professional website.\n\nâ€” {sender_name}"
         )
 
     def build_wa_prefill_link(digits, message) -> str:
@@ -194,9 +194,9 @@ except Exception:
         d = re.sub(r"\D", "", str(digits or ""))
         return f"https://wa.me/{d}?text={quote(message)}" if d else ""
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Constants
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _VALID_WA = {"verified", "opted_in", "estimated", "business_confirmed", "unknown"}
 
 MARKET_ORDER = {
@@ -235,24 +235,24 @@ _PRIORITY_LABEL = {
     "unscored": "UNSCORED",
 }
 _WA_BADGE = {
-    "verified":           ("✅ WA Verified",           _GREEN),
-    "opted_in":           ("✅ WA Opted-In",            _GREEN),
-    "business_confirmed": ("🟠 WA Business Confirmed",  _GOLD),
-    "estimated":          ("💬 WA Estimated",           _GOLD),
-    "unknown":            ("⚪ WA Unknown",              _TEXT_MUT),
+    "verified":           ("âœ… WA Verified",           _GREEN),
+    "opted_in":           ("âœ… WA Opted-In",            _GREEN),
+    "business_confirmed": ("ðŸŸ  WA Business Confirmed",  _GOLD),
+    "estimated":          ("ðŸ’¬ WA Estimated",           _GOLD),
+    "unknown":            ("âšª WA Unknown",              _TEXT_MUT),
 }
 _STATUS_MAP = {
-    "📞 Called — No Answer": "called",
-    "🔄 Callback Requested":  "callback",
-    "✅ Interested":          "interested",
-    "❌ Not Interested":      "not_interested",
-    "💰 Deal Closed":         "deal_closed",
-    "🚫 Wrong Number":        "wrong_number",
+    "ðŸ“ž Called â€” No Answer": "called",
+    "ðŸ”„ Callback Requested":  "callback",
+    "âœ… Interested":          "interested",
+    "âŒ Not Interested":      "not_interested",
+    "ðŸ’° Deal Closed":         "deal_closed",
+    "ðŸš« Wrong Number":        "wrong_number",
 }
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # BUG-028: Session-aware sender name resolver
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_sender_name() -> str:
     """
@@ -269,9 +269,9 @@ def _get_sender_name() -> str:
     return SENDER_NAME
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Page CSS
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _render_page_css() -> None:
     # CSS uses string concatenation for colour values to avoid
     # f-string maintenance trap (BUG-APP-02 pattern).
@@ -549,9 +549,9 @@ def _render_page_css() -> None:
     st.markdown(css, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Helpers
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _esc(v) -> str:
     return html.escape(str(v if v is not None else ""))
@@ -583,10 +583,10 @@ def _parse_json_list(value) -> list:
 def _fmt_money(value) -> str:
     try:
         if isinstance(value, str) and _norm(value) in ("", "none", "null"):
-            return "₦0"
-        return f"₦{float(value or 0):,.0f}"
+            return "â‚¦0"
+        return f"â‚¦{float(value or 0):,.0f}"
     except Exception:
-        return "₦0"
+        return "â‚¦0"
 
 def _priority_rank(p: str) -> int:
     return {"high": 0, "medium": 1, "low": 2, "unscored": 3}.get(_norm(p), 3)
@@ -656,9 +656,9 @@ def _wa_gate(lead: dict) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Section header
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _section(title: str, subtitle: str = "") -> None:
     sub_html = (
@@ -677,9 +677,9 @@ def section_header(title: str, subtitle: str = "") -> None:
     _section(title, subtitle)
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Badge helpers
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _badge(label: str, color: str, bg: str = "") -> str:
     if not bg: bg = color + "18"
@@ -699,13 +699,13 @@ def _priority_badge(priority: str) -> str:
 
 def _wa_badge_html(lead: dict) -> str:
     ws = _wa_status(lead)
-    label, color = _WA_BADGE.get(ws, ("⚪ WA Unknown", _TEXT_MUT))
+    label, color = _WA_BADGE.get(ws, ("âšª WA Unknown", _TEXT_MUT))
     return _badge(label, color)
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # KPI card
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _kpi_card(icon: str, title: str, value, sub: str, color: str) -> None:
     st.markdown(
@@ -720,9 +720,9 @@ def _kpi_card(icon: str, title: str, value, sub: str, color: str) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Detail block
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _detail_block(label: str, value: str) -> None:
     st.markdown(
@@ -734,9 +734,9 @@ def _detail_block(label: str, value: str) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Data helpers
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def get_pipeline_summary() -> dict:
     if get_connection is None: return {}
@@ -755,10 +755,10 @@ def get_pipeline_summary() -> dict:
             except Exception: pass
 
 
-# ─────────────────────────────────────────────────────────
-# BUG-CC-01: Live stats reader — reads directly from leads table
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# BUG-CC-01: Live stats reader â€” reads directly from leads table
 # ISSUE-B: high_fit threshold corrected to >= 70 (0-100 scale)
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def get_live_stats() -> dict:
     """
@@ -776,7 +776,7 @@ def get_live_stats() -> dict:
         cur.execute("SELECT COUNT(*) FROM leads")
         total = cur.fetchone()[0] or 0
 
-        # ISSUE-B: corrected threshold — scorer outputs 0-100
+        # ISSUE-B: corrected threshold â€” scorer outputs 0-100
         cur.execute("SELECT COUNT(*) FROM leads WHERE fit_score >= 70")
         high_fit = cur.fetchone()[0] or 0
 
@@ -951,9 +951,11 @@ def get_call_queue(limit: int = 200) -> list:
         seen.add(lid)
         if not str(lead.get("phone") or "").strip(): continue
         if not _status_allowed(lead.get("contact_status")): continue
+        # WA_SENT_FIX_R1: a lead already messaged leaves the queue for good
+        if _wa_status(lead) == "sent": continue
         out.append(lead)
 
-    # BUG-029: market → wa_status → -fit_score → -urgency_score → priority_rank
+    # BUG-029: market â†’ wa_status â†’ -fit_score â†’ -urgency_score â†’ priority_rank
     out.sort(key=lambda l: (
         MARKET_ORDER.get(_norm(l.get("market")), 99),
         (0 if _wa_status(l) in {"verified", "opted_in"} else
@@ -996,14 +998,14 @@ def _get_unscored_lead_ids(
     market:      str = "All",
 ) -> list:
     """
-    ISSUE-G: Enrichment gate added — only 'complete'/'enriched' leads
+    ISSUE-G: Enrichment gate added â€” only 'complete'/'enriched' leads
     enter the scoring queue. Matches BUG-SC-05 requirement.
     """
     if get_connection is None: return []
     conn   = None
     scope  = _norm(score_scope)
     params = []
-    # ISSUE-G: enrichment gate — only enriched leads can be scored
+    # ISSUE-G: enrichment gate â€” only enriched leads can be scored
     where  = """
         (fit_score IS NULL
          OR lead_priority IS NULL
@@ -1037,10 +1039,10 @@ def _get_unscored_lead_ids(
             except Exception: pass
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Batch scoring
 # ISSUE-C: thresholds corrected to 70/50 (0-100 scale)
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _score_with_progress(
     batch_size:  int,
@@ -1061,7 +1063,7 @@ def _score_with_progress(
         "<div style='font-size:11px;font-weight:700;"
         "text-transform:uppercase;letter-spacing:1px;"
         "color:" + _BRAND_BLUE + ";margin-bottom:8px;'>"
-        "📊 Scoring Progress</div>",
+        "ðŸ“Š Scoring Progress</div>",
         unsafe_allow_html=True,
     )
 
@@ -1079,7 +1081,7 @@ def _score_with_progress(
         )
         status_slot.markdown(
             "<div style='color:" + _TEXT_SEC + ";font-size:12px;padding:4px 0;'>"
-            "⏳ Scoring <b>" + str(i) + "</b> / <b>" + str(total) + "</b> — "
+            "â³ Scoring <b>" + str(i) + "</b> / <b>" + str(total) + "</b> â€” "
             + _esc(lead_name) + "</div>",
             unsafe_allow_html=True,
         )
@@ -1092,11 +1094,11 @@ def _score_with_progress(
                 p   = _norm(res.get("lead_priority", ""))
                 # ISSUE-C: thresholds on 0-100 scale
                 if p == "high"   or fit >= 70:
-                    high += 1;   dot = "🟢"; fc = _GREEN
+                    high += 1;   dot = "ðŸŸ¢"; fc = _GREEN
                 elif p == "medium" or fit >= 50:
-                    medium += 1; dot = "🟡"; fc = _GOLD
+                    medium += 1; dot = "ðŸŸ¡"; fc = _GOLD
                 else:
-                    low += 1;    dot = "🔴"; fc = _RED
+                    low += 1;    dot = "ðŸ”´"; fc = _RED
 
                 feedback_slot.markdown(
                     "<div style='background:rgba(255,255,255,0.025);"
@@ -1112,20 +1114,20 @@ def _score_with_progress(
             else:
                 feedback_slot.markdown(
                     "<div style='color:" + _GOLD + ";font-size:12px;padding:4px 0;'>"
-                    "⚠️ Skipped: " + _esc(lead_name) + "</div>",
+                    "âš ï¸ Skipped: " + _esc(lead_name) + "</div>",
                     unsafe_allow_html=True,
                 )
         except Exception as exc:
             feedback_slot.markdown(
                 "<div style='color:" + _RED + ";font-size:12px;padding:4px 0;'>"
-                "⚠️ Error: " + _esc(lead_name) + ": " + _esc(str(exc)) + "</div>",
+                "âš ï¸ Error: " + _esc(lead_name) + ": " + _esc(str(exc)) + "</div>",
                 unsafe_allow_html=True,
             )
 
     progress_bar.progress(1.0)
     status_slot.markdown(
         "<div style='color:" + _GREEN + ";font-size:13px;font-weight:700;"
-        "padding:6px 0;'>✅ Done — " + str(scored) + "/" + str(total) + " scored</div>",
+        "padding:6px 0;'>âœ… Done â€” " + str(scored) + "/" + str(total) + " scored</div>",
         unsafe_allow_html=True,
     )
     feedback_slot.empty()
@@ -1135,11 +1137,11 @@ def _score_with_progress(
     }
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Call outcome logger
 # BUG-027: dedup via session_state["_logged_outcomes"]
 # ISSUE-A: revenue write via save_revenue_record() (BUG-DB-07)
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _outreach_dedup_key(lead_id, channel: str, status: str) -> tuple:
     return (int(lead_id), str(channel).lower(), str(status).lower())
@@ -1192,15 +1194,15 @@ def log_call_outcome(
         if isinstance(result, tuple) and len(result) == 2:
             ok, err_msg = result
             if not ok and err_msg:
-                st.warning("⚠️ Outreach log warning: " + _esc(err_msg))
+                st.warning("âš ï¸ Outreach log warning: " + _esc(err_msg))
     except Exception as exc:
-        st.warning("⚠️ Could not write outreach log: " + _esc(str(exc)))
+        st.warning("âš ï¸ Could not write outreach log: " + _esc(str(exc)))
 
-    # Mark deduped before revenue write — revenue failure should not
+    # Mark deduped before revenue write â€” revenue failure should not
     # allow the outcome to be re-logged
     st.session_state["_logged_outcomes"].add(dedup_key)
 
-    # ISSUE-A: use save_revenue_record() — enforces UNIQUE(lead_id, service_type)
+    # ISSUE-A: use save_revenue_record() â€” enforces UNIQUE(lead_id, service_type)
     if status == "deal_closed" and deal_value and deal_value > 0:
         try:
             save_revenue_record(
@@ -1214,10 +1216,10 @@ def log_call_outcome(
             st.error("Error logging deal: " + _esc(str(exc)))
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Call script fallback
-# BUG-028: sender_name from _get_sender_name() — not business name
-# ─────────────────────────────────────────────────────────
+# BUG-028: sender_name from _get_sender_name() â€” not business name
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _script_fallback(lead: dict) -> str:
     name        = lead.get("business_name", "your business")
@@ -1229,25 +1231,25 @@ def _script_fallback(lead: dict) -> str:
     sender_name = _get_sender_name()
     return (
         f"{opener or f'Hi, is that the owner of {name}?'}\n\n"
-        f"My name is {sender_name} — I help {industry} businesses "
+        f"My name is {sender_name} â€” I help {industry} businesses "
         f"in {city}{', ' + country if country else ''} get more "
         f"customers through a professional website.\n\n"
         f"I noticed {name} might benefit from:\n"
-        f"  → Professional website design\n"
-        f"  → Google presence and local SEO\n"
-        f"  → WhatsApp enquiry button\n"
-        f"  → Mobile-friendly layout\n\n"
+        f"  â†’ Professional website design\n"
+        f"  â†’ Google presence and local SEO\n"
+        f"  â†’ WhatsApp enquiry button\n"
+        f"  â†’ Mobile-friendly layout\n\n"
         f"Could I take 2 minutes to share what I found?\n\n"
-        f"[INTERESTED] Great — I can show you a quick concept and pricing.\n"
+        f"[INTERESTED] Great â€” I can show you a quick concept and pricing.\n"
         f"[BUSY] No problem. When is a better time to call?\n"
-        f"[NO WEBSITE] I noticed you don't have a website yet — "
+        f"[NO WEBSITE] I noticed you don't have a website yet â€” "
         f"that's where we can help fastest."
     )
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Hero
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_hero() -> None:
     now = datetime.now()
@@ -1267,9 +1269,9 @@ def render_hero() -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # KPI rows
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_pipeline_kpis() -> None:
     pipeline = get_pipeline_summary()
@@ -1277,12 +1279,12 @@ def render_pipeline_kpis() -> None:
 
     _section("Pipeline Overview", "Live outreach and deal status.")
     cards = [
-        ("📋", "Total Leads",  _safe_int(stats.get("total_leads", 0)),        "In database",     _BRAND_BLUE),
-        ("💬", "WA Verified",  _safe_int(stats.get("whatsapp_verified", 0)),  "Agent confirmed", _WA_GREEN),
-        ("🟡", "WA Estimated", _safe_int(stats.get("whatsapp_estimated", 0)), "Heuristic",       _GOLD),
-        ("✅", "Interested",   _safe_int(pipeline.get("interested", 0)),       "Warm prospects",  _GREEN),
-        ("📞", "Called",       _safe_int(pipeline.get("called", 0)),           "Outreach done",   _BRAND_PUR),
-        ("🔥", "Closed",       _safe_int(pipeline.get("deal_closed", 0)),      "Deals won",       _RED),
+        ("ðŸ“‹", "Total Leads",  _safe_int(stats.get("total_leads", 0)),        "In database",     _BRAND_BLUE),
+        ("ðŸ’¬", "WA Verified",  _safe_int(stats.get("whatsapp_verified", 0)),  "Agent confirmed", _WA_GREEN),
+        ("ðŸŸ¡", "WA Estimated", _safe_int(stats.get("whatsapp_estimated", 0)), "Heuristic",       _GOLD),
+        ("âœ…", "Interested",   _safe_int(pipeline.get("interested", 0)),       "Warm prospects",  _GREEN),
+        ("ðŸ“ž", "Called",       _safe_int(pipeline.get("called", 0)),           "Outreach done",   _BRAND_PUR),
+        ("ðŸ”¥", "Closed",       _safe_int(pipeline.get("deal_closed", 0)),      "Deals won",       _RED),
     ]
     cols = st.columns(6)
     for i, (icon, title, value, sub, color) in enumerate(cards):
@@ -1292,7 +1294,7 @@ def render_pipeline_kpis() -> None:
     revenue = _fmt_money(stats.get("total_revenue", 0))
     st.markdown(
         "<div class='cc-revenue' style='margin-top:10px;'>"
-        "<div class='cc-revenue-label'>💰 Revenue</div>"
+        "<div class='cc-revenue-label'>ðŸ’° Revenue</div>"
         "<div class='cc-revenue-value'>" + revenue + "</div>"
         "</div>",
         unsafe_allow_html=True,
@@ -1303,12 +1305,12 @@ def render_intelligence_kpis() -> None:
     stats = get_live_stats()
     _section("Channel Intelligence", "AI scoring and outreach readiness.")
     cards = [
-        ("⭐", "High Fit",        _safe_int(stats.get("high_fit_leads", 0)),             "Best prospects",  _GREEN),
-        ("🤖", "AI Call Ready",   _safe_int(stats.get("ai_call_ready", 0)),              "Voice queue",     _BRAND_PUR),
-        ("💬", "WhatsApp Ready",  _safe_int(stats.get("whatsapp_ready", 0)),             "WA queue",        _WA_GREEN),
-        ("📧", "Email Ready",     _safe_int(stats.get("email_ready", 0)),                "Email queue",     _BRAND_BLUE),
-        ("👤", "Decision Makers", _safe_int(stats.get("leads_with_decision_maker", 0)),  "Named contacts",  _RED),
-        ("🧠", "Unscored",        _safe_int(stats.get("unscored_leads", 0)),             "Need scoring",    _TEXT_MUT),
+        ("â­", "High Fit",        _safe_int(stats.get("high_fit_leads", 0)),             "Best prospects",  _GREEN),
+        ("ðŸ¤–", "AI Call Ready",   _safe_int(stats.get("ai_call_ready", 0)),              "Voice queue",     _BRAND_PUR),
+        ("ðŸ’¬", "WhatsApp Ready",  _safe_int(stats.get("whatsapp_ready", 0)),             "WA queue",        _WA_GREEN),
+        ("ðŸ“§", "Email Ready",     _safe_int(stats.get("email_ready", 0)),                "Email queue",     _BRAND_BLUE),
+        ("ðŸ‘¤", "Decision Makers", _safe_int(stats.get("leads_with_decision_maker", 0)),  "Named contacts",  _RED),
+        ("ðŸ§ ", "Unscored",        _safe_int(stats.get("unscored_leads", 0)),             "Need scoring",    _TEXT_MUT),
     ]
     cols = st.columns(6)
     for i, (icon, title, value, sub, color) in enumerate(cards):
@@ -1316,9 +1318,9 @@ def render_intelligence_kpis() -> None:
             _kpi_card(icon, title, value, sub, color)
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Scoring banner
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_scoring_banner(
     queue_country: str = "All",
@@ -1331,7 +1333,7 @@ def render_scoring_banner(
     st.markdown(
         "<div class='cc-scoring-banner'>"
         "<div style='font-size:16px;font-weight:800;"
-        "color:" + _TEXT_PRI + ";margin-bottom:6px;'>🧠 Scoring Backlog</div>"
+        "color:" + _TEXT_PRI + ";margin-bottom:6px;'>ðŸ§  Scoring Backlog</div>"
         "<div style='font-size:13px;color:" + _TEXT_SEC + ";'>"
         "<b style='color:" + _TEXT_PRI + ";'>" + f"{unscored:,}" + "</b>"
         " leads waiting to be scored."
@@ -1366,17 +1368,17 @@ def render_scoring_banner(
         else "all"
     )
     actual = min(batch_size, unscored)
-    btn    = f"🧠 Score Next {actual} Leads"
+    btn    = f"ðŸ§  Score Next {actual} Leads"
     if score_scope == "country" and queue_country != "All":
-        btn += f" · {queue_country}"
+        btn += f" Â· {queue_country}"
     elif score_scope == "market" and queue_market != "All":
-        btn += f" · {queue_market}"
+        btn += f" Â· {queue_market}"
 
     if st.button(
         btn, type="primary",
         use_container_width=True, key="score_cc_btn",
     ):
-        with st.spinner("Scoring…"):
+        with st.spinner("Scoringâ€¦"):
             res = _score_with_progress(
                 actual, score_scope=score_scope,
                 country=queue_country, market=queue_market,
@@ -1385,18 +1387,18 @@ def render_scoring_banner(
             st.warning("No unscored leads matched this scope.")
         else:
             st.success(
-                f"✅ {res.get('scored',0)}/{res.get('total',0)} scored — "
-                f"High: {res.get('high',0)} · "
-                f"Medium: {res.get('medium',0)} · "
+                f"âœ… {res.get('scored',0)}/{res.get('total',0)} scored â€” "
+                f"High: {res.get('high',0)} Â· "
+                f"Medium: {res.get('medium',0)} Â· "
                 f"Low: {res.get('low',0)}"
             )
         st.rerun()
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Current lead detail
 # ISSUE-D: fit_score thresholds and label corrected (0-100 scale)
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _generate_queue_vcf(queue: list) -> str:
@@ -1430,7 +1432,7 @@ def render_current_lead(lead: dict) -> None:
             "background:rgba(255,255,255,0.02);"
             "border:1px dashed " + _BORDER_MID + ";"
             "border-radius:16px;'>"
-            "<div style='font-size:32px;margin-bottom:12px;'>🎉</div>"
+            "<div style='font-size:32px;margin-bottom:12px;'>ðŸŽ‰</div>"
             "<div style='font-size:15px;font-weight:700;"
             "color:" + _TEXT_SEC + ";margin-bottom:6px;'>Queue Empty</div>"
             "<div style='font-size:13px;color:" + _TEXT_MUT + ";'>"
@@ -1441,19 +1443,19 @@ def render_current_lead(lead: dict) -> None:
         return
 
     name     = lead.get("business_name") or "Unknown"
-    industry = lead.get("industry")      or "—"
+    industry = lead.get("industry")      or "â€”"
     city     = lead.get("city")          or ""
     country  = lead.get("country")       or ""
-    phone    = lead.get("phone")         or "—"
-    email    = lead.get("email")         or "—"
-    website  = lead.get("website")       or "—"
+    phone    = lead.get("phone")         or "â€”"
+    email    = lead.get("email")         or "â€”"
+    website  = lead.get("website")       or "â€”"
     source   = lead.get("source")        or "unknown"
     market   = lead.get("market")        or ""
     dm       = lead.get("decision_maker_name") or "Not found"
     opener   = lead.get("recommended_opener") or _script_fallback(lead)
     reason   = lead.get("fit_reason")    or "No analysis yet."
     pains    = _parse_json_list(lead.get("pain_points"))
-    routing  = lead.get("routing_reason") or "—"
+    routing  = lead.get("routing_reason") or "â€”"
     priority = _norm(lead.get("lead_priority") or "unscored")
     channel  = lead.get("best_channel")  or "manual"
 
@@ -1474,8 +1476,8 @@ def render_current_lead(lead: dict) -> None:
         _GREEN if fit_score >= 70 else
         _GOLD  if fit_score >= 50 else _RED
     )
-    wa_label, wa_color = _WA_BADGE.get(wa, ("⚪ WA Unknown", _TEXT_MUT))
-    loc = " · ".join(p for p in [city, country] if p)
+    wa_label, wa_color = _WA_BADGE.get(wa, ("âšª WA Unknown", _TEXT_MUT))
+    loc = " Â· ".join(p for p in [city, country] if p)
 
     # ISSUE-D: display fit_score on 0-100 scale with correct label
     fit_display = f"{fit_score:.0f}"
@@ -1540,37 +1542,37 @@ def render_current_lead(lead: dict) -> None:
 
     if wa in {"verified", "opted_in"}:
         st.markdown(
-            "<div class='cc-wa-verified'>✅ WhatsApp verified for this lead</div>",
+            "<div class='cc-wa-verified'>âœ… WhatsApp verified for this lead</div>",
             unsafe_allow_html=True,
         )
     elif wa in {"estimated", "business_confirmed"}:
         st.markdown(
-            "<div class='cc-wa-estimated'>💬 WhatsApp estimated — confirm before sending</div>",
+            "<div class='cc-wa-estimated'>ðŸ’¬ WhatsApp estimated â€” confirm before sending</div>",
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            "<div class='cc-wa-unknown'>📵 WhatsApp not confirmed — verify on the right panel</div>",
+            "<div class='cc-wa-unknown'>ðŸ“µ WhatsApp not confirmed â€” verify on the right panel</div>",
             unsafe_allow_html=True,
         )
 
     d1, d2, d3 = st.columns(3)
-    with d1: _detail_block("📞 Phone",          phone)
-    with d2: _detail_block("📧 Email",          email)
-    with d3: _detail_block("👤 Decision Maker", dm)
+    with d1: _detail_block("ðŸ“ž Phone",          phone)
+    with d2: _detail_block("ðŸ“§ Email",          email)
+    with d3: _detail_block("ðŸ‘¤ Decision Maker", dm)
 
-    _detail_block("🌐 Website",  website)
-    _detail_block("📍 Location", f"{city} {country}".strip() or "—")
-    _detail_block("📋 Routing",  routing)
+    _detail_block("ðŸŒ Website",  website)
+    _detail_block("ðŸ“ Location", f"{city} {country}".strip() or "â€”")
+    _detail_block("ðŸ“‹ Routing",  routing)
 
-    with st.expander("💡 Why This Lead", expanded=True):
+    with st.expander("ðŸ’¡ Why This Lead", expanded=True):
         st.markdown(
             "<div style='color:" + _TEXT_SEC + ";font-size:13px;"
             "line-height:1.7;'>" + _esc(reason) + "</div>",
             unsafe_allow_html=True,
         )
 
-    with st.expander("💬 Recommended Opener", expanded=True):
+    with st.expander("ðŸ’¬ Recommended Opener", expanded=True):
         st.markdown(
             "<div style='color:" + _TEXT_SEC + ";font-size:13px;"
             "line-height:1.7;font-style:italic;'>"
@@ -1579,18 +1581,18 @@ def render_current_lead(lead: dict) -> None:
         )
 
     if pains:
-        with st.expander("🔴 Pain Points", expanded=False):
+        with st.expander("ðŸ”´ Pain Points", expanded=False):
             for p in pains[:6]:
                 st.markdown(
                     "<div style='color:#fca5a5;font-size:12px;"
-                    "padding:3px 0;'>• " + _esc(str(p)) + "</div>",
+                    "padding:3px 0;'>â€¢ " + _esc(str(p)) + "</div>",
                     unsafe_allow_html=True,
                 )
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Call script panel
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_call_script(lead: dict) -> None:
     _section("Call Script", "Use opener first, then follow the flow.")
@@ -1604,10 +1606,10 @@ def render_call_script(lead: dict) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # WhatsApp panels
 # BUG-028: sender name always from _get_sender_name()
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_whatsapp_verify_button(lead: dict, key_suffix: str = "") -> None:
     lead_id = lead.get("id")
@@ -1616,9 +1618,9 @@ def render_whatsapp_verify_button(lead: dict, key_suffix: str = "") -> None:
 
     ws = _wa_status(lead)
     if ws in {"verified", "opted_in"} or _safe_int(lead.get("whatsapp_verified")):
-        st.success("✅ WhatsApp verified")
+        st.success("âœ… WhatsApp verified")
         if st.button(
-            "❌ Remove Verification",
+            "âŒ Remove Verification",
             key=f"wa_unverify_{lead_id}{key_suffix}",
             use_container_width=True,
         ):
@@ -1630,7 +1632,7 @@ def render_whatsapp_verify_button(lead: dict, key_suffix: str = "") -> None:
     else:
         st.caption("Confirm this number is on WhatsApp first.")
         if st.button(
-            "✅ Mark as WhatsApp Verified",
+            "âœ… Mark as WhatsApp Verified",
             key=f"wa_verify_{lead_id}{key_suffix}",
             use_container_width=True,
         ):
@@ -1652,7 +1654,7 @@ def render_whatsapp_manual_tools(
         if wa_link:
             st.markdown(
                 '<a href="' + wa_link + '" target="_blank" class="cc-wa-btn">'
-                '💬 Open WhatsApp Check</a>',
+                'ðŸ’¬ Open WhatsApp Check</a>',
                 unsafe_allow_html=True,
             )
     with c2:
@@ -1661,23 +1663,23 @@ def render_whatsapp_manual_tools(
 
 def render_whatsapp_composer(lead: dict, wa_gate: dict) -> None:
     """
-    BUG-028: sender_name from _get_sender_name() — never from lead fields.
+    BUG-028: sender_name from _get_sender_name() â€” never from lead fields.
     The greeting recipient in the message is the decision maker or business,
     not the sender.
     """
     lead_id     = lead.get("id", "x")
     phone_clean = wa_gate.get("phone_clean", "")
     verified    = wa_gate.get("verified", False)
-    badge       = "✅ Verified" if verified else "⚠️ Estimated"
+    badge       = "âœ… Verified" if verified else "âš ï¸ Estimated"
 
-    _section("WhatsApp Composer", f"Tone-matched message · {badge}")
+    _section("WhatsApp Composer", f"Tone-matched message Â· {badge}")
 
     tone = st.selectbox(
         "Tone", ["friendly", "formal", "direct"], index=0,
         key=f"wa_tone_{lead_id}",
     )
 
-    # BUG-028: sender_name from session state — never lead's business name
+    # BUG-028: sender_name from session state â€” never lead's business name
     sender_name = _get_sender_name()
     generated = build_whatsapp_message(
         lead, tone=tone,
@@ -1698,9 +1700,13 @@ def render_whatsapp_composer(lead: dict, wa_gate: dict) -> None:
     if wa_link:
         st.markdown(
             '<a href="' + wa_link + '" target="_blank" class="cc-wa-btn">'
-            '💬 Send via WhatsApp ' + _esc(badge) + '</a>',
+            'ðŸ’¬ Send via WhatsApp ' + _esc(badge) + '</a>',
             unsafe_allow_html=True,
         )
+        # WA_SENT_FIX_R1: a link cannot record anything - this button can
+        st.caption("1) Open WhatsApp above and press send.  2) Then record it here so the "
+                   "queue advances and WA SENT moves off zero.")
+        render_wa_sent_button(lead, final_msg)
         st.markdown(
             "<div style='font-size:11px;color:" + _TEXT_MUT + ";margin-top:4px;'>"
             "From: " + _esc(sender_name) + " &middot; "
@@ -1712,9 +1718,69 @@ def render_whatsapp_composer(lead: dict, wa_gate: dict) -> None:
         st.warning("No valid phone to open WhatsApp.")
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Queue panel
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# WA_SENT_FIX_R1: record an actual WhatsApp send
+#
+# The dashboard counts leads.wa_status = 'sent'. Before this patch nothing wrote
+# that value, so WA SENT was 0 no matter how many messages went out. The button
+# below writes it, then moves the queue.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def record_wa_sent(lead: dict, message: str = "") -> bool:
+    """Write wa_status='sent' + contact_status='contacted'. True if it stuck."""
+    lead_id = lead.get("id")
+    if not lead_id:
+        return False
+    try:
+        update_lead_status(int(lead_id), "contacted", "WhatsApp message sent")
+    except Exception:
+        return False
+    ok = False
+    try:
+        if get_connection is not None:
+            conn = get_connection()
+            try:
+                cur = conn.execute(
+                    "UPDATE leads SET wa_status = 'sent' WHERE id = ?", (int(lead_id),)
+                )
+                conn.commit()
+                ok = bool(cur.rowcount)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        return False
+    try:
+        log_outreach_action(
+            lead_id=int(lead_id), channel="whatsapp",
+            message_text=(message or "")[:2000], status="sent",
+        )
+    except Exception:
+        pass
+    return ok
+
+
+def render_wa_sent_button(lead: dict, message: str, key_suffix: str = "") -> None:
+    """Mark this lead as sent and advance to the next one in the queue."""
+    if st.button(
+        "\u2705 I sent this message \u2014 mark sent & next",
+        type="primary", use_container_width=True,
+        key="wasent_" + str(lead.get("id", key_suffix)),
+    ):
+        if record_wa_sent(lead, message):
+            st.success("Marked sent. Loading the next lead\u2026")
+        else:
+            st.warning("Could not record the send \u2014 check the database connection.")
+        st.session_state["call_idx"] = st.session_state.get("call_idx", 0) + 1
+        st.rerun()
+
 
 def render_queue_panel(queue: list, idx: int) -> None:
     total = max(len(queue), 1)
@@ -1742,10 +1808,10 @@ def render_queue_panel(queue: list, idx: int) -> None:
         st.metric("Position", f"{idx+1} / {len(queue)}")
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Outcome logger
 # ISSUE-J: deal_value uses _safe_float()
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_outcome_logger(lead: dict, idx: int, queue: list) -> None:
     _section("Log Outcome", "Record what happened on this call.")
@@ -1769,7 +1835,7 @@ def render_outcome_logger(lead: dict, idx: int, queue: list) -> None:
     deal_value = 0.0
     if "Deal Closed" in outcome:
         raw_val    = st.number_input(
-            "Deal Value (₦)", min_value=0,
+            "Deal Value (â‚¦)", min_value=0,
             value=300000, step=10000,
             key=f"deal_{lead.get('id', idx)}",
         )
@@ -1780,7 +1846,7 @@ def render_outcome_logger(lead: dict, idx: int, queue: list) -> None:
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button(
-            "💾 Save & Next", type="primary",
+            "ðŸ’¾ Save & Next", type="primary",
             use_container_width=True,
             key=f"save_{lead.get('id', idx)}",
         ):
@@ -1790,27 +1856,27 @@ def render_outcome_logger(lead: dict, idx: int, queue: list) -> None:
                 notes=notes, deal_value=deal_value,
             )
             st.session_state["call_idx"] = idx + 1
-            st.success("✅ Saved.")
+            st.success("âœ… Saved.")
             st.rerun()
     with c2:
         if st.button(
-            "⏭️ Skip", use_container_width=True,
+            "â­ï¸ Skip", use_container_width=True,
             key=f"skip_{lead.get('id', idx)}",
         ):
             st.session_state["call_idx"] = idx + 1
             st.rerun()
     with c3:
         if st.button(
-            "🔙 Back", use_container_width=True,
+            "ðŸ”™ Back", use_container_width=True,
             key=f"prev_{lead.get('id', idx)}",
         ):
             st.session_state["call_idx"] = max(0, idx - 1)
             st.rerun()
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Tab content
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_prospect_table() -> None:
     _section("AI Prospect Queue", "Leads ranked by AI fit for calling first.")
@@ -1845,9 +1911,9 @@ def render_deals_panel() -> None:
     st.dataframe(df, use_container_width=True, hide_index=True, height=400)
 
 
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Main render
-# ─────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_call_center() -> None:
     _render_page_css()
@@ -1869,21 +1935,21 @@ def render_call_center() -> None:
     f1, f2, f3, f4 = st.columns(4)
     with f1:
         queue_country = st.selectbox(
-            "🌍 Country", country_opts, index=0, key="queue_country",
+            "ðŸŒ Country", country_opts, index=0, key="queue_country",
         )
     with f2:
         queue_market = st.selectbox(
-            "🗺️ Market", market_opts, index=0, key="queue_market",
+            "ðŸ—ºï¸ Market", market_opts, index=0, key="queue_market",
         )
     with f3:
         queue_channel = st.selectbox(
-            "📡 Channel",
+            "ðŸ“¡ Channel",
             ["All", "whatsapp", "ai_call", "email", "manual"],
             index=0, key="queue_channel",
         )
     with f4:
         queue_wa = st.selectbox(
-            "💬 WA Status",
+            "ðŸ’¬ WA Status",
             ["All", "verified", "estimated",
              "business_confirmed", "opted_in", "unknown"],
             index=0, key="queue_wa",
@@ -1900,10 +1966,10 @@ def render_call_center() -> None:
     )
 
     tabs = st.tabs([
-        "📞  Call Queue",
-        "🧠  AI Prospects",
-        "📋  Call History",
-        "💰  Closed Deals",
+        "ðŸ“ž  Call Queue",
+        "ðŸ§   AI Prospects",
+        "ðŸ“‹  Call History",
+        "ðŸ’°  Closed Deals",
     ])
 
     with tabs[0]:
@@ -1927,7 +1993,7 @@ def render_call_center() -> None:
                 "background:rgba(255,255,255,0.02);"
                 "border:1px dashed " + _BORDER_MID + ";"
                 "border-radius:18px;margin-top:20px;'>"
-                "<div style='font-size:36px;margin-bottom:14px;'>🎉</div>"
+                "<div style='font-size:36px;margin-bottom:14px;'>ðŸŽ‰</div>"
                 "<div style='font-size:16px;font-weight:700;"
                 "color:" + _TEXT_SEC + ";margin-bottom:6px;'>Queue empty</div>"
                 "<div style='font-size:13px;color:" + _TEXT_MUT + ";'>"
@@ -1952,11 +2018,11 @@ def render_call_center() -> None:
             b1, b2, b3 = st.columns([2.5, 1.3, 1.2])
             with b1:
                 if unverified_in_queue:
-                    st.info(f"⚡ **{len(unverified_in_queue)} leads** in this queue are unverified. Bulk-verify them in 1 click instead of 1-by-1.")
+                    st.info(f"âš¡ **{len(unverified_in_queue)} leads** in this queue are unverified. Bulk-verify them in 1 click instead of 1-by-1.")
                 else:
-                    st.success(f"✅ All {len(queue)} leads in this queue are WhatsApp Verified!")
+                    st.success(f"âœ… All {len(queue)} leads in this queue are WhatsApp Verified!")
             with b2:
-                if unverified_in_queue and st.button(f"⚡ Bulk Verify {len(unverified_in_queue)} Leads", key="bulk_wa_verify_btn", use_container_width=True):
+                if unverified_in_queue and st.button(f"âš¡ Bulk Verify {len(unverified_in_queue)} Leads", key="bulk_wa_verify_btn", use_container_width=True):
                     try:
                         n = batch_verify_whatsapp(unverified_in_queue, verified=True)
                         st.success(f"Successfully verified {n} leads!")
@@ -1966,7 +2032,7 @@ def render_call_center() -> None:
             with b3:
                 vcf_data = _generate_queue_vcf(queue)
                 st.download_button(
-                    "📱 Export VCF",
+                    "ðŸ“± Export VCF",
                     data=vcf_data,
                     file_name="kncs_whatsapp_leads.vcf",
                     mime="text/vcard",
@@ -2015,7 +2081,7 @@ def render_call_center() -> None:
                     if clean:
                         st.markdown(
                             '<a href="tel:+' + clean + '" class="cc-call-btn">'
-                            '📞 Call: ' + _esc(raw_phone) + '</a>',
+                            'ðŸ“ž Call: ' + _esc(raw_phone) + '</a>',
                             unsafe_allow_html=True,
                         )
 
