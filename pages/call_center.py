@@ -197,7 +197,8 @@ except Exception:
 # ---------------------------------------------------------
 # Constants
 # ---------------------------------------------------------
-_VALID_WA = {"verified", "opted_in", "estimated", "business_confirmed", "unknown"}
+_VALID_WA = {"verified", "opted_in", "estimated", "business_confirmed", "unknown",
+               "sent"}   # WA_SENT_FIX_R2: "sent" is written by record_wa_sent()
 
 MARKET_ORDER = {
     "nigeria": 0, "africa": 1, "uk": 2, "europe": 3,
@@ -952,7 +953,11 @@ def get_call_queue(limit: int = 200) -> list:
         if not str(lead.get("phone") or "").strip(): continue
         if not _status_allowed(lead.get("contact_status")): continue
         # WA_SENT_FIX_R1: a lead already messaged leaves the queue for good
-        if _wa_status(lead) == "sent": continue
+        # WA_SENT_FIX_R2: read the raw column as well, because _wa_status()
+        # used to blank out "sent" (it was not in _VALID_WA) and fall back to
+        # "verified" from wa_verified - so a messaged lead never left the queue.
+        _raw_wa = _norm(lead.get("wa_status") or "")
+        if _raw_wa == "sent" or _wa_status(lead) == "sent": continue
         out.append(lead)
 
     # BUG-029: market -> wa_status -> -fit_score -> -urgency_score -> priority_rank
